@@ -655,6 +655,25 @@ pub const DEFAULT_OLLAMA_PORT: u16 = 11434;
 
 pub const LMSTUDIO_OSS_PROVIDER_ID: &str = "lmstudio";
 pub const OLLAMA_OSS_PROVIDER_ID: &str = "ollama";
+/// Invision gateway (fork Invision): toda inferência passa pelo /v1 da Invision.
+pub const INVISION_PROVIDER_ID: &str = "invision";
+pub const INVISION_DEFAULT_BASE_URL: &str = "https://invision.dreamvision.com.br/v1";
+
+/// Provedor nativo da Invision. A URL pode ser trocada por `INVISION_BASE_URL`
+/// (ex.: rede interna da VPS); a chave vem sempre de `INVISION_API_KEY`.
+pub fn create_invision_provider() -> ModelProviderInfo {
+    let base_url = std::env::var("INVISION_BASE_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| INVISION_DEFAULT_BASE_URL.to_string());
+    let mut p = create_oss_provider_with_base_url(&base_url, WireApi::Responses);
+    p.name = "Invision".into();
+    p.env_key = Some("INVISION_API_KEY".into());
+    p.env_key_instructions = Some("Crie uma chave em https://invision.dreamvision.com.br/api/keys".into());
+    p.request_max_retries = Some(2);
+    p.stream_max_retries = Some(2);
+    p
+}
 
 /// Built-in default provider list.
 pub fn built_in_model_providers(
@@ -672,6 +691,7 @@ pub fn built_in_model_providers(
     // `model_providers` in config.toml to add their own providers.
     [
         (OPENAI_PROVIDER_ID, openai_provider),
+        (INVISION_PROVIDER_ID, create_invision_provider()),
         (AMAZON_BEDROCK_PROVIDER_ID, amazon_bedrock_provider),
         (
             AMAZON_BEDROCK_RUNTIME_PROVIDER_ID,
@@ -776,6 +796,19 @@ pub fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> M
         supports_standalone_web_search: false,
         capabilities: None,
         include_internal_metadata: false,
+    }
+}
+
+#[cfg(test)]
+mod invision_tests {
+    use super::*;
+    #[test]
+    fn invision_provider_is_built_in_and_uses_gateway_key() {
+        let all = built_in_model_providers(None);
+        let p = all.get(INVISION_PROVIDER_ID).expect("invision provider");
+        assert_eq!(p.env_key.as_deref(), Some("INVISION_API_KEY"));
+        assert!(p.base_url.as_deref().unwrap_or("").ends_with("/v1"));
+        assert!(!p.requires_openai_auth);
     }
 }
 
