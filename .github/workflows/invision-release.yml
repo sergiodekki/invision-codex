@@ -24,6 +24,9 @@ jobs:
       - name: Testes do provedor Invision
         working-directory: codex-rs
         run: cargo test -p codex-model-provider-info invision
+      # V8 pronto e conferido por checksum (manifesto em third_party/v8), igual à release oficial.
+      - uses: ./.github/actions/setup-rusty-v8
+        with: { target: x86_64-unknown-linux-gnu }
       - name: Build
         working-directory: codex-rs
         run: |
