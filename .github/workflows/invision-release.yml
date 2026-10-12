@@ -20,7 +20,7 @@ jobs:
           sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
           rustup show
       - uses: Swatinem/rust-cache@v2
-        with: { workspaces: codex-rs }
+        with: { workspaces: codex-rs, prefix-key: v2-gnu-2204 }
       - name: Testes do provedor Invision
         working-directory: codex-rs
         run: cargo test -p codex-model-provider-info invision
