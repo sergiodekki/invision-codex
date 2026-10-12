@@ -1,4 +1,5 @@
-# Invision: compila o binário Linux (musl, para a imagem Alpine) e publica como release.
+# Invision: compila o binário Linux (glibc, imagem Debian do app) e publica como release.
+# glibc porque o codex-code-mode-host embute V8, que não tem build pronto para musl.
 name: invision-release
 on:
   push:
@@ -9,15 +10,15 @@ permissions:
   contents: write
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
-      - name: Rust + musl
+      - name: Rust (glibc)
         working-directory: codex-rs
         run: |
-          sudo apt-get update && sudo apt-get install -y musl-tools pkg-config
-          rustup show && rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+          rustup show
       - uses: Swatinem/rust-cache@v2
         with: { workspaces: codex-rs }
       - name: Testes do provedor Invision
@@ -26,12 +27,19 @@ jobs:
       - name: Build
         working-directory: codex-rs
         run: |
-          # Um só build: o openssl vendorizado do core vale também para o code-mode-host (musl).
-          cargo build --release --target x86_64-unknown-linux-musl -p codex-cli --bin codex -p codex-code-mode-host --bin codex-code-mode-host
+          cargo build --release --target x86_64-unknown-linux-gnu -p codex-cli --bin codex -p codex-code-mode-host --bin codex-code-mode-host
+      - name: Teste do pacote
+        run: |
+          set -e
+          D=codex-rs/target/x86_64-unknown-linux-gnu/release
+          $D/codex --version
+          test -x $D/codex-code-mode-host
+          ldd $D/codex $D/codex-code-mode-host
+          sha256sum $D/codex $D/codex-code-mode-host | tee SHA256SUMS
       - name: Release
         env: { GH_TOKEN: "${{ github.token }}" }
         run: |
           TAG="invision-$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
-          cp codex-rs/target/x86_64-unknown-linux-musl/release/codex codex-invision-linux-x64
-          cp codex-rs/target/x86_64-unknown-linux-musl/release/codex-code-mode-host codex-code-mode-host-linux-x64
-          gh release create "$TAG" codex-invision-linux-x64 codex-code-mode-host-linux-x64 --title "$TAG" --notes "Build Invision de ${GITHUB_SHA}" --latest
+          cp codex-rs/target/x86_64-unknown-linux-gnu/release/codex codex-invision-linux-x64
+          cp codex-rs/target/x86_64-unknown-linux-gnu/release/codex-code-mode-host codex-code-mode-host-linux-x64
+          gh release create "$TAG" codex-invision-linux-x64 codex-code-mode-host-linux-x64 SHA256SUMS --title "$TAG" --notes "Build Invision de ${GITHUB_SHA} (x86_64-unknown-linux-gnu)" --latest
