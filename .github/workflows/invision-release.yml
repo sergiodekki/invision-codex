@@ -26,9 +26,11 @@ jobs:
       - name: Build
         working-directory: codex-rs
         run: cargo build --release --target x86_64-unknown-linux-musl -p codex-cli --bin codex
+          cargo build --release --target x86_64-unknown-linux-musl -p codex-code-mode-host --bin codex-code-mode-host
       - name: Release
         env: { GH_TOKEN: "${{ github.token }}" }
         run: |
           TAG="invision-$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
           cp codex-rs/target/x86_64-unknown-linux-musl/release/codex codex-invision-linux-x64
-          gh release create "$TAG" codex-invision-linux-x64 --title "$TAG" --notes "Build Invision de ${GITHUB_SHA}" --latest
+          cp codex-rs/target/x86_64-unknown-linux-musl/release/codex-code-mode-host codex-code-mode-host-linux-x64
+          gh release create "$TAG" codex-invision-linux-x64 codex-code-mode-host-linux-x64 --title "$TAG" --notes "Build Invision de ${GITHUB_SHA}" --latest
