@@ -25,7 +25,8 @@ jobs:
         run: cargo test -p codex-model-provider-info invision
       - name: Build
         working-directory: codex-rs
-        run: cargo build --release --target x86_64-unknown-linux-musl -p codex-cli --bin codex
+        run: |
+          cargo build --release --target x86_64-unknown-linux-musl -p codex-cli --bin codex
           cargo build --release --target x86_64-unknown-linux-musl -p codex-code-mode-host --bin codex-code-mode-host
       - name: Release
         env: { GH_TOKEN: "${{ github.token }}" }
