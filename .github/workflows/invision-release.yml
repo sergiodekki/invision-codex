@@ -1,0 +1,32 @@
+# Invision: compila o binário Linux (musl, para a imagem Alpine) e publica como release.
+name: invision-release
+on:
+  push:
+    branches: [main]
+    paths: ["codex-rs/**", ".github/workflows/invision-release.yml"]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust + musl
+        working-directory: codex-rs
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools pkg-config
+          rustup show && rustup target add x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: codex-rs }
+      - name: Testes do provedor Invision
+        working-directory: codex-rs
+        run: cargo test -p codex-model-provider-info invision
+      - name: Build
+        working-directory: codex-rs
+        run: cargo build --release --target x86_64-unknown-linux-musl -p codex-cli --bin codex
+      - name: Release
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          TAG="invision-$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
+          cp codex-rs/target/x86_64-unknown-linux-musl/release/codex codex-invision-linux-x64
+          gh release create "$TAG" codex-invision-linux-x64 --title "$TAG" --notes "Build Invision de ${GITHUB_SHA}" --latest
