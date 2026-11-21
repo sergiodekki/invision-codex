@@ -4,8 +4,104 @@ use super::*;
 use crate::config_panel::ConfigPreference;
 use crate::config_panel::ConfigToggle;
 use crate::config_update::format_config_error;
+use crate::legacy_core::config::load_config_toml_with_layer_stack;
+use crate::local_settings::LocalSettings;
+use codex_app_server_protocol::RequestId;
+use serde::de::IgnoredAny;
 
 impl App {
+    pub(super) async fn update_reasoning_summary(
+        &mut self,
+        server: &AppServerSession,
+        requested: Option<codex_protocol::config_types::ReasoningSummary>,
+    ) {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            if self.reconnect.offline {
+                color_eyre::eyre::bail!(
+                    "Reconnect to the app server to change reasoning summaries"
+                );
+            }
+            let handle = server.request_handle();
+            if let Some(summary) = requested {
+                handle
+                    .request_typed::<IgnoredAny>(ClientRequest::ConfigBatchWrite {
+                        request_id: RequestId::String(Uuid::new_v4().to_string()),
+                        params: ConfigBatchWriteParams {
+                            edits: vec![crate::config_update::replace_config_value(
+                                "model_reasoning_summary",
+                                serde_json::json!(summary),
+                            )],
+                            file_path: None,
+                            expected_version: None,
+                            reload_user_config: false,
+                        },
+                    })
+                    .await?;
+            }
+            let cwd = super::startup::startup_config_cwd(
+                self.chat_widget.config_ref(),
+                server,
+                &self.app_server_target,
+                /*resumed_cwd*/ None,
+            );
+            let effective = crate::config_update::read_effective_config_if_supported(handle, cwd)
+                .await?
+                .ok_or_else(|| {
+                    color_eyre::eyre::eyre!(
+                        "Update the connected app server to change reasoning summaries"
+                    )
+                })?;
+            let mut summary = effective.config.model_reasoning_summary;
+            if matches!(
+                &self.app_server_target,
+                crate::AppServerTarget::Remote { .. } | crate::AppServerTarget::LocalDaemon { .. }
+            ) {
+                let config = self
+                    .rebuild_config_for_cwd(self.chat_widget.config_ref().cwd.to_path_buf())
+                    .await
+                    .unwrap_or_else(|_| self.config.clone());
+                if super::new_session::has_launch_setting(
+                    &config,
+                    &self.cli_kv_overrides,
+                    "model_reasoning_summary",
+                ) {
+                    summary = config.model_reasoning_summary;
+                }
+            }
+            Ok::<_, color_eyre::Report>(summary)
+        })
+        .await
+        .map_err(|_| color_eyre::eyre::eyre!("server timed out"))
+        .and_then(std::convert::identity);
+        match result {
+            Ok(effective) => {
+                self.chat_widget.config_panel_reasoning_summary =
+                    Some((server.backend_id(), effective));
+                let notice = requested.map(|summary| {
+                    if effective == Some(summary) {
+                        "Saved · applies to new chats".into()
+                    } else {
+                        "Saved · overridden by config or launch setting".into()
+                    }
+                });
+                self.chat_widget.refresh_config_panel(notice);
+            }
+            Err(error) => {
+                let error = format!(
+                    "Could not confirm reasoning summary setting: {}",
+                    format_config_error(&error)
+                );
+                self.chat_widget.config_panel_reasoning_summary = None;
+                let updated = self
+                    .chat_widget
+                    .refresh_config_panel(requested.map(|_| error.clone()));
+                if requested.is_some() && !updated {
+                    self.chat_widget.add_error_message(error);
+                }
+            }
+        }
+    }
+
     pub(super) async fn save_config_preference(
         &mut self,
         tui: &mut tui::Tui,
@@ -34,8 +130,26 @@ impl App {
         } else {
             self.chat_widget.config_ref().cwd.to_path_buf()
         };
-        let resolved = match self.rebuild_config_for_cwd(config_cwd).await {
-            Ok(config) => crate::local_settings::LocalSettings::from(&config),
+        let resolved = match async {
+            let cwd = AbsolutePathBuf::relative_to_current_dir(&config_cwd)?;
+            let bootstrap = load_config_toml_with_layer_stack(
+                self.local_settings.codex_home.as_path(),
+                Some(&cwd),
+                self.cli_kv_overrides.clone(),
+                codex_config::ConfigLoadOptions {
+                    loader_overrides: self.loader_overrides.clone(),
+                    cloud_config_bundle: self.cloud_config_bundle.clone(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            LocalSettings::from_bootstrap(&bootstrap, self.local_settings.codex_home.clone())
+                .map_err(std::io::Error::other)
+        }
+        .await
+        .wrap_err_with(|| format!("Failed to rebuild config for cwd {}", config_cwd.display()))
+        {
+            Ok(settings) => settings,
             Err(error) => {
                 self.chat_widget
                     .refresh_config_panel(
@@ -80,6 +194,9 @@ impl App {
                 setting.enabled(&resolved.tui) == enabled
             }
             ConfigPreference::CopyOnSelect(mode) => resolved.tui.copy_on_select == mode,
+            ConfigPreference::MouseScrollSpeed(speed) => {
+                resolved.tui.mouse_scroll_speed == Some(speed)
+            }
             ConfigPreference::NotificationCondition(condition) => {
                 resolved.tui.notification_settings.condition == condition
             }
@@ -102,8 +219,13 @@ impl App {
         } else {
             None
         };
-        self.chat_widget
-            .refresh_config_panel(notice.map(str::to_string));
+        let notice = notice.map(str::to_string);
+        if effective {
+            self.chat_widget
+                .refresh_config_panel_after_effective_save(notice, preference);
+        } else {
+            self.chat_widget.refresh_config_panel(notice);
+        }
         tui.frame_requester().schedule_frame();
     }
 }

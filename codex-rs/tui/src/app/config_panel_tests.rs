@@ -11,6 +11,86 @@ use crate::config_panel::ConfigEditorHandoff;
 use crate::local_settings::LocalSettings;
 use codex_protocol::config_types::TrustLevel;
 use pretty_assertions::assert_eq;
+use tokio::sync::mpsc::UnboundedReceiver;
+
+fn open_effects_editor(app: &mut App) {
+    let handoff = ConfigEditorHandoff::new(
+        ConfigEditor::Effects,
+        crate::key_hint::plain(KeyCode::Enter),
+    );
+    handoff.mark_activation_inactive();
+    app.chat_widget.open_config_editor(
+        handoff,
+        crate::config_panel::ResumeCurrentAvailability::Available,
+    );
+}
+
+#[tokio::test]
+async fn reasoning_summary_saves_explicit_auto_for_new_chats() -> Result<()> {
+    use codex_protocol::config_types::ReasoningSummary;
+
+    let mut app = Box::pin(make_test_app()).await;
+    let profile = tempfile::tempdir()?;
+    let path = profile.path().join("work.config.toml");
+    std::fs::write(&path, "")?;
+    app.loader_overrides.user_config_path = Some(path.clone().abs());
+    app.loader_overrides.user_config_profile = Some("work".parse()?);
+    app.app_server_target = AppServerTarget::LocalDaemon {
+        allow_embedded_fallback: true,
+        endpoint: crate::RemoteAppServerEndpoint::UnixSocket {
+            socket_path: profile.path().join("daemon.sock").abs(),
+        },
+    };
+    app.config = app
+        .rebuild_config_for_cwd(app.config.cwd.to_path_buf())
+        .await?;
+    let server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+    let current = app.chat_widget.config_ref().model_reasoning_summary;
+    app.chat_widget.open_config_panel();
+    app.update_reasoning_summary(&server, /*requested*/ None)
+        .await;
+    assert_eq!(
+        app.chat_widget.config_panel_reasoning_summary,
+        Some((server.backend_id(), None))
+    );
+    assert!(
+        !std::fs::read_to_string(&app.local_settings.user_config_path)
+            .unwrap_or_default()
+            .contains("model_reasoning_summary")
+    );
+
+    app.update_reasoning_summary(&server, Some(ReasoningSummary::Auto))
+        .await;
+    let saved: toml::Value = toml::from_str(&std::fs::read_to_string(
+        &app.local_settings.user_config_path,
+    )?)?;
+    assert_eq!(saved["model_reasoning_summary"].as_str(), Some("auto"));
+    assert_eq!(
+        app.chat_widget.config_ref().model_reasoning_summary,
+        current
+    );
+    assert_eq!(
+        app.chat_widget.config_panel_reasoning_summary,
+        Some((server.backend_id(), Some(ReasoningSummary::Auto)))
+    );
+
+    std::fs::write(&path, "model_reasoning_summary = 'detailed'\n")?;
+    app.update_reasoning_summary(&server, Some(ReasoningSummary::Concise))
+        .await;
+    assert_eq!(
+        app.chat_widget.config_panel_reasoning_summary,
+        Some((server.backend_id(), Some(ReasoningSummary::Detailed)))
+    );
+    server.shutdown().await?;
+    Ok(())
+}
+
+fn next_config_preference(rx: &mut UnboundedReceiver<AppEvent>) -> Result<ConfigPreference> {
+    let AppEvent::SaveConfigPreference(preference) = rx.try_recv()? else {
+        panic!("expected config preference save");
+    };
+    Ok(preference)
+}
 
 #[tokio::test]
 async fn config_toggle_save_uses_host_config_and_applies_live_while_offline() -> Result<()> {
@@ -72,6 +152,8 @@ async fn config_toggle_save_uses_host_config_and_applies_live_while_offline() ->
     app.chat_widget = ChatWidget::new_with_app_event(init);
     app.local_settings.tui.auto_recap = true;
     app.chat_widget.local_settings.tui.auto_recap = true;
+    // Resolving execution settings would fail, but local preferences remain editable.
+    app.cli_kv_overrides = vec![("model_provider".into(), "missing-provider".into())];
 
     Box::pin(app.handle_event(
         &mut tui,
@@ -124,31 +206,148 @@ async fn config_toggle_save_uses_host_config_and_applies_live_while_offline() ->
 }
 
 #[tokio::test]
-async fn effects_editor_refreshes_after_animation_save() -> Result<()> {
+async fn mouse_scroll_speed_save_updates_local_settings_and_config_file() -> Result<()> {
+    let mut app = Box::pin(make_test_app()).await;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    app.save_config_preference(&mut tui, ConfigPreference::MouseScrollSpeed(1.5))
+        .await;
+    app.prepare_conversation(
+        ratatui::layout::Rect::new(
+            /*x*/ 0, /*y*/ 0, /*width*/ 80, /*height*/ 24,
+        ),
+        /*conversation_inset*/ None,
+        &tui.frame_requester(),
+    );
+
+    let saved: toml::Value = toml::from_str(&std::fs::read_to_string(
+        &app.local_settings.user_config_path,
+    )?)?;
+    assert_eq!(
+        (
+            saved["tui"]["mouse_scroll_speed"].as_float(),
+            app.local_settings.tui.mouse_scroll_speed,
+            app.chat_widget.config_panel_tui.mouse_scroll_speed,
+            app.transcript_view.mouse_scroll_speed,
+        ),
+        (Some(1.5), Some(1.5), Some(1.5), 1.5),
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn effects_editor_refresh_preserves_pending_toggles() -> Result<()> {
     let (mut app, mut rx, _ops) = crate::app::tests::make_test_app_with_channels().await;
     let mut tui = crate::tui::test_support::make_test_tui()?;
     app.local_settings.tui.animations = false;
     app.chat_widget.local_settings.tui.animations = false;
     app.chat_widget.config_panel_tui.animations = false;
-    let handoff = ConfigEditorHandoff::new(
-        ConfigEditor::Effects,
-        crate::key_hint::plain(KeyCode::Enter),
-    );
-    handoff.mark_activation_inactive();
-    app.chat_widget.open_config_editor(
-        handoff,
-        crate::config_panel::ResumeCurrentAvailability::Available,
-    );
+    open_effects_editor(&mut app);
 
     app.chat_widget.handle_key_event(KeyCode::Enter.into());
-    let AppEvent::SaveConfigPreference(preference) = rx.try_recv()? else {
-        panic!("expected animation save");
-    };
-    app.save_config_preference(&mut tui, preference).await;
+    app.chat_widget.handle_key_event(KeyCode::Enter.into());
+    let first_preference = next_config_preference(&mut rx)?;
+    app.save_config_preference(&mut tui, first_preference).await;
 
     insta::assert_snapshot!(
         "effects_picker_after_animation_save",
         render_bottom_popup(&app.chat_widget, /*width*/ 80)
+    );
+
+    app.chat_widget.handle_key_event(KeyCode::Enter.into());
+    let second_preference = next_config_preference(&mut rx)?;
+    app.save_config_preference(&mut tui, second_preference)
+        .await;
+    let third_preference = next_config_preference(&mut rx)?;
+    assert_eq!(
+        third_preference,
+        ConfigPreference::Toggle {
+            setting: ConfigToggle::Animations,
+            enabled: true,
+        }
+    );
+    app.save_config_preference(&mut tui, third_preference).await;
+    assert!(app.chat_widget.config_panel_tui.animations);
+    Ok(())
+}
+
+#[tokio::test]
+async fn effects_editor_preserves_pending_stars_while_disabled() -> Result<()> {
+    let (mut app, mut rx, _ops) = crate::app::tests::make_test_app_with_channels().await;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    app.local_settings.tui.animations = true;
+    app.local_settings.tui.effects.starfield = true;
+    app.chat_widget.local_settings.tui.animations = true;
+    app.chat_widget.local_settings.tui.effects.starfield = true;
+    app.chat_widget.config_panel_tui.animations = true;
+    app.chat_widget.config_panel_tui.effects.starfield = true;
+    open_effects_editor(&mut app);
+
+    for shortcut in ['1', '2', '2'] {
+        app.chat_widget
+            .handle_key_event(KeyCode::Char(shortcut).into());
+    }
+    let animations_off = next_config_preference(&mut rx)?;
+    assert_eq!(
+        animations_off,
+        ConfigPreference::Toggle {
+            setting: ConfigToggle::Animations,
+            enabled: false,
+        }
+    );
+    app.save_config_preference(&mut tui, animations_off).await;
+
+    app.chat_widget.handle_key_event(KeyCode::Char('1').into());
+    for _ in 0..3 {
+        let preference = next_config_preference(&mut rx)?;
+        app.save_config_preference(&mut tui, preference).await;
+    }
+
+    assert_eq!(
+        (
+            app.chat_widget.config_panel_tui.animations,
+            app.chat_widget.config_panel_tui.effects.starfield,
+        ),
+        (true, true),
+    );
+    app.chat_widget.handle_key_event(KeyCode::Char('2').into());
+    assert_eq!(
+        next_config_preference(&mut rx)?,
+        ConfigPreference::Toggle {
+            setting: ConfigToggle::ComposerStars,
+            enabled: false,
+        }
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn effects_editor_reset_clears_pending_toggle_state() -> Result<()> {
+    let (mut app, mut rx, _ops) = crate::app::tests::make_test_app_with_channels().await;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    app.local_settings.tui.animations = true;
+    app.local_settings.tui.effects.starfield = true;
+    app.chat_widget.local_settings.tui.animations = true;
+    app.chat_widget.local_settings.tui.effects.starfield = true;
+    app.chat_widget.config_panel_tui.animations = true;
+    app.chat_widget.config_panel_tui.effects.starfield = true;
+    open_effects_editor(&mut app);
+
+    app.chat_widget.handle_key_event(KeyCode::Char('1').into());
+    app.chat_widget.handle_key_event(KeyCode::Char('2').into());
+    let _animations_off = next_config_preference(&mut rx)?;
+    let stars_off = next_config_preference(&mut rx)?;
+
+    app.chat_widget.refresh_config_panel(/*notice*/ None);
+    app.save_config_preference(&mut tui, stars_off).await;
+
+    assert!(!app.chat_widget.config_panel_tui.effects.starfield);
+    app.chat_widget.handle_key_event(KeyCode::Char('2').into());
+    assert_eq!(
+        next_config_preference(&mut rx)?,
+        ConfigPreference::Toggle {
+            setting: ConfigToggle::ComposerStars,
+            enabled: true,
+        }
     );
     Ok(())
 }

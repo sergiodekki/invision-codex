@@ -64,6 +64,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 const CALL_ID: &str = "pushed-remote-process-events";
 const POLL_CALL_ID: &str = "poll-remote-process-events";
+const DRAIN_POLL_CALL_ID: &str = "poll-during-remote-drain";
 const COMPLETE_OUTPUT: &str = "pushed remote output\n";
 const RECOVERED_OUTPUT: &str = "recovered missing output\n";
 const RETAINED_OUTPUT: &str = "retained output\n";
@@ -74,18 +75,24 @@ const REPLAY_RETAINED_OUTPUT_SEQ: u64 = 800;
 #[cfg_attr(windows, allow(dead_code))]
 enum PushedExecScenario {
     Complete,
+    CredentialMasking,
+    CredentialMaskingCustomProvidersUnsupported,
+    CredentialMaskingUnsupportedShell,
+    CredentialMaskingUnsupported,
     OutputAfterExit,
     OutputAfterRecoveredExit,
     OutputOpenAtDeadline,
     OutputOpenAtFinalPoll,
     OutputOpenWhenCancelled,
+    OutputOpenWhenResumableCancelled,
     OutputOpenWhenTerminated,
+    OutputOpenWhenTerminatedBeforeYield,
     CodexPath,
     CodexPathDefaultFeature,
     CodexPathDisabledFeature,
     CodexPathWithExplicitOverride,
     UnusableCodexPath,
-    DirectDenied,
+    DirectDenied { output_closed: bool },
     DenyWin,
     DenyWinUnchanged,
     DenyOldLinux,
@@ -188,6 +195,18 @@ async fn respond_environment_info(
             | PushedExecScenario::RejectedLongWindowsDangerousCommand
     ) {
         json!({ "name": "powershell", "path": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" })
+    } else if matches!(
+        scenario,
+        PushedExecScenario::CredentialMaskingUnsupportedShell
+    ) {
+        json!({ "name": "sh", "path": "/bin/sh" })
+    } else if matches!(
+        scenario,
+        PushedExecScenario::CredentialMasking
+            | PushedExecScenario::CredentialMaskingCustomProvidersUnsupported
+            | PushedExecScenario::CredentialMaskingUnsupported
+    ) {
+        json!({ "name": "bash", "path": "/bin/bash" })
     } else {
         json!({ "name": "zsh", "path": "/bin/zsh" })
     };
@@ -197,10 +216,22 @@ async fn respond_environment_info(
         | PushedExecScenario::RejectedLongWindowsDangerousCommand => Some("windows"),
         PushedExecScenario::DenyOldLinux
         | PushedExecScenario::DenyOldLinuxWithRoot(_)
-        | PushedExecScenario::DenyLinux => Some("linux"),
+        | PushedExecScenario::DenyLinux
+        | PushedExecScenario::CredentialMasking
+        | PushedExecScenario::CredentialMaskingCustomProvidersUnsupported
+        | PushedExecScenario::CredentialMaskingUnsupportedShell
+        | PushedExecScenario::CredentialMaskingUnsupported => Some("linux"),
         _ => None,
     };
     let mut capabilities = json!({ "networkProxyLaunch": true });
+    if matches!(
+        scenario,
+        PushedExecScenario::CredentialMasking
+            | PushedExecScenario::CredentialMaskingCustomProvidersUnsupported
+            | PushedExecScenario::CredentialMaskingUnsupportedShell
+    ) {
+        capabilities["credentialMasking"] = json!(true);
+    }
     if matches!(
         scenario,
         PushedExecScenario::DenyOldLinuxWithRoot(_) | PushedExecScenario::DenyLinux
@@ -240,6 +271,7 @@ async fn serve_exec_with_pushed_events(
     scenario: PushedExecScenario,
     process_started: Arc<AtomicBool>,
     output_ready: Arc<tokio::sync::Notify>,
+    drain_read_ready: Arc<tokio::sync::Notify>,
 ) -> PushedExecServerResult {
     let unrestricted_patch = matches!(
         scenario,
@@ -383,6 +415,7 @@ async fn serve_exec_with_pushed_events(
             _ => b"x",
         }
     };
+    let replay_stream = |seq| if seq == 1 { "stderr" } else { "stdout" };
     if matches!(scenario, PushedExecScenario::ReplayGap) {
         // The process replay log retains 256 events. This burst is much larger
         // than both that log and the JSON-RPC event queue, so the reader must
@@ -398,7 +431,7 @@ async fn serve_exec_with_pushed_events(
                     "params": {
                         "processId": &process_id,
                         "seq": seq,
-                        "stream": "stdout",
+                        "stream": replay_stream(seq),
                         "chunk": BASE64_STANDARD.encode(replay_output(seq)),
                     }
                 }),
@@ -434,9 +467,11 @@ async fn serve_exec_with_pushed_events(
         PushedExecScenario::OutputOpenAtDeadline
             | PushedExecScenario::OutputOpenAtFinalPoll
             | PushedExecScenario::OutputOpenWhenCancelled
+            | PushedExecScenario::OutputOpenWhenResumableCancelled
             | PushedExecScenario::OutputOpenWhenTerminated
+            | PushedExecScenario::OutputOpenWhenTerminatedBeforeYield
     );
-    if output_stays_open {
+    if output_stays_open || matches!(scenario, PushedExecScenario::OutputAfterExit) {
         output_ready.notified().await;
     }
     let mut process_read_requests = 0;
@@ -446,7 +481,9 @@ async fn serve_exec_with_pushed_events(
         | PushedExecScenario::OutputOpenAtDeadline
         | PushedExecScenario::OutputOpenAtFinalPoll
         | PushedExecScenario::OutputOpenWhenCancelled
-        | PushedExecScenario::OutputOpenWhenTerminated => {
+        | PushedExecScenario::OutputOpenWhenResumableCancelled
+        | PushedExecScenario::OutputOpenWhenTerminated
+        | PushedExecScenario::OutputOpenWhenTerminatedBeforeYield => {
             send_exec_server_json(
                 &mut websocket,
                 json!({
@@ -493,22 +530,36 @@ async fn serve_exec_with_pushed_events(
                 )
                 .await;
             }
+            if matches!(scenario, PushedExecScenario::OutputAfterExit) {
+                // Keep the tail in transit until the initial collection yields.
+                output_ready.notified().await;
+            }
             // Model foreground output delayed in transit beyond the local post-exit grace.
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            send_exec_server_json(
-                &mut websocket,
-                json!({
-                    "method": "process/output",
-                    "params": {
-                        "processId": &process_id,
-                        "seq": 3,
-                        "stream": "stdout",
-                        "chunk": BASE64_STANDARD.encode("remote output\n"),
-                    }
-                }),
+            // An active final poll must also outlive the five-second background drain.
+            tokio::time::sleep(
+                if matches!(scenario, PushedExecScenario::OutputOpenAtFinalPoll) {
+                    Duration::from_secs(6)
+                } else {
+                    Duration::from_millis(250)
+                },
             )
             .await;
-            if !output_stays_open {
+            if !matches!(scenario, PushedExecScenario::OutputOpenAtDeadline) {
+                send_exec_server_json(
+                    &mut websocket,
+                    json!({
+                        "method": "process/output",
+                        "params": {
+                            "processId": &process_id,
+                            "seq": 3,
+                            "stream": "stdout",
+                            "chunk": BASE64_STANDARD.encode("remote output\n"),
+                        }
+                    }),
+                )
+                .await;
+            }
+            if !output_stays_open || matches!(scenario, PushedExecScenario::OutputOpenAtFinalPoll) {
                 send_exec_server_json(
                     &mut websocket,
                     json!({
@@ -520,6 +571,10 @@ async fn serve_exec_with_pushed_events(
             }
         }
         PushedExecScenario::Complete
+        | PushedExecScenario::CredentialMasking
+        | PushedExecScenario::CredentialMaskingCustomProvidersUnsupported
+        | PushedExecScenario::CredentialMaskingUnsupportedShell
+        | PushedExecScenario::CredentialMaskingUnsupported
         | PushedExecScenario::DenyWin
         | PushedExecScenario::DenyWinUnchanged
         | PushedExecScenario::DenyOldLinux
@@ -562,7 +617,7 @@ async fn serve_exec_with_pushed_events(
         PushedExecScenario::RejectedLongWindowsDangerousCommand => {
             panic!("dangerous command must not reach the executor")
         }
-        PushedExecScenario::DirectDenied => {
+        PushedExecScenario::DirectDenied { output_closed } => {
             send_exec_server_json(
                 &mut websocket,
                 json!({
@@ -576,6 +631,16 @@ async fn serve_exec_with_pushed_events(
                 }),
             )
             .await;
+            if output_closed {
+                send_exec_server_json(
+                    &mut websocket,
+                    json!({
+                        "method": "process/closed",
+                        "params": { "processId": &process_id, "seq": 2 }
+                    }),
+                )
+                .await;
+            }
         }
         PushedExecScenario::SandboxedInterceptedPatch
         | PushedExecScenario::SandboxedDirectPatch
@@ -604,26 +669,79 @@ async fn serve_exec_with_pushed_events(
         PushedExecScenario::ReplayGap => {}
     }
 
+    let mut pending_drain_response = None;
     loop {
         let wait = if output_stays_open {
             STARTUP_TIMEOUT
         } else {
             Duration::from_secs(/*secs*/ 5)
         };
-        let request = read_exec_server_json(&mut websocket, wait).await;
+        let request = tokio::select! {
+            request = read_exec_server_json(&mut websocket, wait) => request,
+            _ = output_ready.notified(), if pending_drain_response.is_some() => {
+                send_exec_server_json(
+                    &mut websocket,
+                    pending_drain_response.take().expect("pending final read"),
+                ).await;
+                continue;
+            }
+        };
         match request["method"].as_str() {
+            Some("fs/getMetadata") => {
+                // Starting the polling turn still needs filesystem metadata while the read waits.
+                send_exec_server_json(
+                    &mut websocket,
+                    json!({
+                        "id": request["id"],
+                        "error": { "code": -32004, "message": "not found" }
+                    }),
+                )
+                .await;
+            }
             Some("process/read") => {
                 process_read_requests += 1;
                 let result = match scenario {
+                    PushedExecScenario::OutputOpenAtDeadline => {
+                        assert_eq!(request["params"]["afterSeq"], 2);
+                        // Hold the final read until a later poll yields its buffered output.
+                        // The tail remains recoverable even after that poll's deadline.
+                        drain_read_ready.notify_one();
+                        json!({
+                            "chunks": [{
+                                "seq": 3,
+                                "stream": "stdout",
+                                "chunk": BASE64_STANDARD.encode("remote output\n"),
+                            }],
+                            "nextSeq": 4,
+                            "exited": true,
+                            "exitCode": 0,
+                            "closed": false,
+                            "failure": null,
+                            "sandboxDenied": false,
+                        })
+                    }
+                    PushedExecScenario::OutputOpenWhenResumableCancelled => json!({
+                        "chunks": [],
+                        "nextSeq": 4,
+                        "exited": true,
+                        "exitCode": 0,
+                        "closed": false,
+                        "failure": null,
+                        "sandboxDenied": false,
+                    }),
                     PushedExecScenario::OutputAfterExit
                     | PushedExecScenario::OutputAfterRecoveredExit
-                    | PushedExecScenario::OutputOpenAtDeadline
                     | PushedExecScenario::OutputOpenAtFinalPoll
                     | PushedExecScenario::OutputOpenWhenCancelled
-                    | PushedExecScenario::OutputOpenWhenTerminated => {
+                    | PushedExecScenario::OutputOpenWhenTerminated
+                    | PushedExecScenario::OutputOpenWhenTerminatedBeforeYield => {
                         panic!("unexpected read after the delayed-output sequence")
                     }
                     PushedExecScenario::Complete
+                    | PushedExecScenario::CredentialMasking
+                    | PushedExecScenario::CredentialMaskingCustomProvidersUnsupported
+                    | PushedExecScenario::CredentialMaskingUnsupportedShell
+                    | PushedExecScenario::CredentialMaskingUnsupported
                     | PushedExecScenario::CodexPath
                     | PushedExecScenario::CodexPathDefaultFeature
                     | PushedExecScenario::CodexPathDisabledFeature
@@ -641,12 +759,12 @@ async fn serve_exec_with_pushed_events(
                         "failure": null,
                         "sandboxDenied": false,
                     }),
-                    PushedExecScenario::DirectDenied => json!({
+                    PushedExecScenario::DirectDenied { output_closed } => json!({
                         "chunks": [],
-                        "nextSeq": 2,
+                        "nextSeq": if output_closed { 3 } else { 2 },
                         "exited": true,
                         "exitCode": 1,
-                        "closed": false,
+                        "closed": output_closed,
                         "failure": null,
                         "sandboxDenied": true,
                     }),
@@ -685,7 +803,7 @@ async fn serve_exec_with_pushed_events(
                             .map(|seq| {
                                 json!({
                                     "seq": seq,
-                                    "stream": "stdout",
+                                    "stream": replay_stream(seq),
                                     "chunk": BASE64_STANDARD.encode(replay_output(seq)),
                                 })
                             })
@@ -701,14 +819,12 @@ async fn serve_exec_with_pushed_events(
                         })
                     }
                 };
-                send_exec_server_json(
-                    &mut websocket,
-                    json!({
-                        "id": request["id"],
-                        "result": result,
-                    }),
-                )
-                .await;
+                let response = json!({ "id": request["id"], "result": result });
+                if matches!(scenario, PushedExecScenario::OutputOpenAtDeadline) {
+                    pending_drain_response = Some(response);
+                } else {
+                    send_exec_server_json(&mut websocket, response).await;
+                }
                 if matches!(scenario, PushedExecScenario::ReplayGap) && process_read_requests == 1 {
                     send_exec_server_json(
                         &mut websocket,
@@ -748,16 +864,23 @@ async fn serve_exec_with_pushed_events(
 #[test_case(PushedExecScenario::OutputOpenAtDeadline, ManagedNetworkScenario::None, /*foreign_cwd*/ false ; "output_open_at_deadline")]
 #[test_case(PushedExecScenario::OutputOpenAtFinalPoll, ManagedNetworkScenario::None, /*foreign_cwd*/ false ; "output_open_at_final_poll")]
 #[test_case(PushedExecScenario::OutputOpenWhenCancelled, ManagedNetworkScenario::None, /*foreign_cwd*/ false ; "output_open_when_cancelled")]
+#[test_case(PushedExecScenario::OutputOpenWhenResumableCancelled, ManagedNetworkScenario::None, /*foreign_cwd*/ false ; "output_open_when_resumable_cancelled")]
 #[test_case(PushedExecScenario::OutputOpenWhenTerminated, ManagedNetworkScenario::None, /*foreign_cwd*/ false ; "output_open_when_terminated")]
+#[test_case(PushedExecScenario::OutputOpenWhenTerminatedBeforeYield, ManagedNetworkScenario::None, /*foreign_cwd*/ false ; "output_open_when_terminated_before_yield")]
 #[test_case(PushedExecScenario::CodexPath, ManagedNetworkScenario::None, false ; "codex_path_is_exported_before_nested_command")]
 #[test_case(PushedExecScenario::CodexPathDefaultFeature, ManagedNetworkScenario::None, false ; "codex_path_is_not_exported_by_default")]
 #[test_case(PushedExecScenario::CodexPathDisabledFeature, ManagedNetworkScenario::None, false ; "disabled_codex_path_preserves_original_login_command")]
 #[test_case(PushedExecScenario::CodexPathWithExplicitOverride, ManagedNetworkScenario::None, false ; "explicit_path_override_preserves_original_login_command")]
 #[test_case(PushedExecScenario::UnusableCodexPath, ManagedNetworkScenario::None, false ; "unusable_codex_path_preserves_requested_login_shell")]
-#[test_case(PushedExecScenario::DirectDenied, ManagedNetworkScenario::None, false ; "direct_sandbox_denial")]
+#[test_case(PushedExecScenario::DirectDenied { output_closed: false }, ManagedNetworkScenario::None, false ; "direct_sandbox_denial")]
+#[test_case(PushedExecScenario::DirectDenied { output_closed: true }, ManagedNetworkScenario::None, false ; "direct_sandbox_denial_with_closed_output")]
 #[test_case(PushedExecScenario::LegacyExit, ManagedNetworkScenario::None, false ; "legacy_exit_metadata")]
 #[test_case(PushedExecScenario::ReplayGap, ManagedNetworkScenario::None, false ; "truncated_event_replay")]
 #[test_case(PushedExecScenario::Complete, ManagedNetworkScenario::Enabled { policy_callbacks: true }, false ; "managed_network_uses_executor_proxy_launch")]
+#[test_case(PushedExecScenario::CredentialMasking, ManagedNetworkScenario::Enabled { policy_callbacks: true }, false ; "credential_masking_launches_on_supported_executor")]
+#[test_case(PushedExecScenario::CredentialMaskingCustomProvidersUnsupported, ManagedNetworkScenario::Enabled { policy_callbacks: true }, false ; "configured_credential_provider_warns_and_runs_on_old_executor")]
+#[test_case(PushedExecScenario::CredentialMaskingUnsupported, ManagedNetworkScenario::Enabled { policy_callbacks: true }, false ; "credential_masking_warns_and_runs_unsupported_executor")]
+#[test_case(PushedExecScenario::CredentialMaskingUnsupportedShell, ManagedNetworkScenario::Enabled { policy_callbacks: true }, false ; "credential_masking_warns_and_runs_unsupported_shell")]
 #[test_case(PushedExecScenario::Complete, ManagedNetworkScenario::Enabled { policy_callbacks: false }, false ; "strict_managed_allowlist_omits_policy_callbacks")]
 #[test_case(PushedExecScenario::Complete, ManagedNetworkScenario::Disabled, false ; "disabled_managed_network_omits_executor_proxy_launch")]
 #[cfg_attr(not(windows), test_case(PushedExecScenario::Complete, ManagedNetworkScenario::Enabled { policy_callbacks: true }, true ; "foreign_windows_managed_network_preserves_approval_registration"))]
@@ -784,9 +907,27 @@ async fn exec_command_consumes_pushed_remote_process_events(
 ) -> Result<()> {
     let finish_at_deadline = matches!(scenario, PushedExecScenario::OutputOpenAtDeadline);
     let finish_at_final_poll = matches!(scenario, PushedExecScenario::OutputOpenAtFinalPoll);
-    let cancel_after_exit = matches!(scenario, PushedExecScenario::OutputOpenWhenCancelled);
-    let terminate_after_exit = matches!(scenario, PushedExecScenario::OutputOpenWhenTerminated);
+    let resumable_cancel = matches!(
+        scenario,
+        PushedExecScenario::OutputOpenWhenResumableCancelled
+    );
+    let cancel_after_exit =
+        resumable_cancel || matches!(scenario, PushedExecScenario::OutputOpenWhenCancelled);
+    let output_after_yield = matches!(scenario, PushedExecScenario::OutputAfterExit);
+    let terminate_initial_collection = matches!(
+        scenario,
+        PushedExecScenario::OutputOpenWhenTerminatedBeforeYield
+    );
+    let terminate_after_exit = terminate_initial_collection
+        || matches!(scenario, PushedExecScenario::OutputOpenWhenTerminated);
     let explicit_path = "/user/configured/bin:/user/other/bin";
+    let credential_masking = matches!(
+        scenario,
+        PushedExecScenario::CredentialMasking
+            | PushedExecScenario::CredentialMaskingCustomProvidersUnsupported
+            | PushedExecScenario::CredentialMaskingUnsupported
+            | PushedExecScenario::CredentialMaskingUnsupportedShell
+    );
     let managed_network_configured = !matches!(managed_network, ManagedNetworkScenario::None);
     let managed_network_enabled = matches!(managed_network, ManagedNetworkScenario::Enabled { .. });
     let policy_callbacks = matches!(
@@ -835,6 +976,11 @@ async fn exec_command_consumes_pushed_remote_process_events(
             })
             .to_string(),
         ),
+        PushedExecScenario::CredentialMasking => ev_function_call(
+            CALL_ID,
+            "exec_command",
+            &json!({ "cmd": "pwd", "login": false, "yield_time_ms": 1_000 }).to_string(),
+        ),
         _ => ev_function_call(
             CALL_ID,
             "exec_command",
@@ -856,7 +1002,8 @@ async fn exec_command_consumes_pushed_remote_process_events(
                     | PushedExecScenario::CodexPathDisabledFeature => "sh -c 'command -v rg'".to_string(),
                     _ => "pwd".to_string(),
                 },
-                "yield_time_ms": 1_000,
+                "tty": output_after_yield,
+                "yield_time_ms": if resumable_cancel || terminate_initial_collection { 30_000 } else { 1_000 },
             })
             .to_string(),
         ),
@@ -876,7 +1023,7 @@ async fn exec_command_consumes_pushed_remote_process_events(
     if cancel_after_exit {
         responses.truncate(/*len*/ 1);
     }
-    if finish_at_final_poll {
+    if output_after_yield || finish_at_final_poll {
         responses.insert(
             /*index*/ 1,
             sse(vec![
@@ -884,21 +1031,48 @@ async fn exec_command_consumes_pushed_remote_process_events(
                 ev_function_call(
                     POLL_CALL_ID,
                     "write_stdin",
-                    &json!({ "session_id": 1000, "chars": "", "yield_time_ms": 1_000 }).to_string(),
+                    &json!({
+                        "session_id": 1000,
+                        // Exit is already observed; skip stdin but still collect the tail.
+                        "chars": if output_after_yield { "ignored\n" } else { "" },
+                        // The final poll receives output after the five-second background drain.
+                        "yield_time_ms": if finish_at_final_poll { 10_000 } else { 1_000 },
+                    })
+                    .to_string(),
                 ),
                 ev_completed("resp-poll"),
             ]),
         );
     }
+    if finish_at_deadline {
+        for call_id in [DRAIN_POLL_CALL_ID, POLL_CALL_ID] {
+            responses.push(sse(vec![
+                ev_response_created(call_id),
+                ev_function_call(
+                    call_id,
+                    "write_stdin",
+                    &json!({ "session_id": 1000, "chars": "", "yield_time_ms": 1_000 }).to_string(),
+                ),
+                ev_completed(call_id),
+            ]));
+        }
+        responses.push(sse(vec![
+            ev_response_created("resp-drained"),
+            ev_assistant_message("msg-drained", "done"),
+            ev_completed("resp-drained"),
+        ]));
+    }
     let response_mock = mount_sse_sequence(&server, responses).await;
     let exec_server_url = format!("ws://{}", listener.local_addr()?);
     let process_started = Arc::new(AtomicBool::new(false));
     let output_ready = Arc::new(tokio::sync::Notify::new());
+    let drain_read_ready = Arc::new(tokio::sync::Notify::new());
     let exec_server = tokio::spawn(serve_exec_with_pushed_events(
         listener,
         scenario,
         Arc::clone(&process_started),
         Arc::clone(&output_ready),
+        Arc::clone(&drain_read_ready),
     ));
     let mut builder = test_codex().with_exec_server_url(exec_server_url);
     if managed_network_configured {
@@ -931,10 +1105,24 @@ enabled = false
         };
         builder = builder
             .with_cloud_config_bundle(cloud_config_bundle)
-            .with_pre_build_hook(|home| {
+            .with_pre_build_hook(move |home| {
+                let provider_config = if matches!(
+                    scenario,
+                    PushedExecScenario::CredentialMaskingCustomProvidersUnsupported
+                ) {
+                    r#"[features.network_proxy.credentials.vendor]
+env = ["VENDOR_TOKEN"]
+patterns = ["vendor_[a-z]{8}"]
+url_prefix_from_env = "VENDOR_BASE_URL"
+auth = ["bearer"]
+"#
+                } else {
+                    ""
+                };
                 fs::write(
                     home.join("config.toml"),
-                    r#"default_permissions = "workspace"
+                    format!(
+                        r#"default_permissions = "workspace"
 
 [permissions.workspace.filesystem]
 ":minimal" = "read"
@@ -946,6 +1134,8 @@ allow_local_binding = true
 
 [features]
 hooks = true
+credential_masking = {credential_masking}
+{provider_config}
 
 [hooks]
 
@@ -955,12 +1145,13 @@ hooks = true
 type = "command"
 command = "unused"
 timeout = 900
-"#,
+"#
+                    ),
                 )
                 .expect("write managed-network test config");
             });
     }
-    if cancel_after_exit {
+    if matches!(scenario, PushedExecScenario::OutputOpenWhenCancelled) {
         builder = builder.with_cloud_config_bundle(
             CloudConfigBundleFixture::loader_with_enterprise_requirement(
                 "[features]\nunified_exec = false\nshell_tool = true\n",
@@ -1145,9 +1336,15 @@ timeout = 900
     let mut command_end = None;
     let mut stopped = false;
     let mut turn_finished = false;
+    let mut drain_poll_started = false;
     let wait_for_end =
         finish_at_deadline || finish_at_final_poll || cancel_after_exit || terminate_after_exit;
-    let event_timeout = if finish_at_deadline || finish_at_final_poll || terminate_after_exit {
+    let event_timeout = if finish_at_deadline
+        || finish_at_final_poll
+        || terminate_after_exit
+        || resumable_cancel
+        || output_after_yield
+    {
         STARTUP_TIMEOUT
     } else {
         Duration::from_secs(/*secs*/ 5)
@@ -1162,9 +1359,9 @@ timeout = 900
                 EventMsg::ExecCommandBegin(event) if event.call_id == CALL_ID => {
                     saw_exec_command_begin = true;
                     exec_command_begin_command = Some(event.command);
-                    if finish_at_deadline || cancel_after_exit {
-                        // Storage follows the streaming subscription. Wait for it before
-                        // exiting so both deadline cleanup and cancellation see a live session.
+                    if cancel_after_exit || output_after_yield || terminate_initial_collection {
+                        // Storage follows the streaming subscription, so the fixture's
+                        // exit and tail cannot race ahead of the cancellation trigger.
                         timeout(STARTUP_TIMEOUT, async {
                             while test.codex.list_background_terminals().await.is_empty() {
                                 tokio::task::yield_now().await;
@@ -1227,10 +1424,19 @@ timeout = 900
                     stopped = true;
                 }
                 EventMsg::RawResponseItem(raw)
-                    if (finish_at_final_poll || terminate_after_exit)
+                    if finish_at_deadline
+                        && matches!(&raw.item, ResponseItem::FunctionCallOutput { call_id, .. } if call_id.as_deref() == Some(DRAIN_POLL_CALL_ID)) =>
+                {
+                    output_ready.notify_one();
+                }
+                EventMsg::RawResponseItem(raw)
+                    if ((terminate_after_exit && !terminate_initial_collection)
+                        || finish_at_deadline
+                        || finish_at_final_poll
+                        || output_after_yield)
                         && matches!(&raw.item, ResponseItem::FunctionCallOutput { call_id, .. } if call_id.as_deref() == Some(CALL_ID)) =>
                 {
-                    // Polling and explicit termination must observe exit after the initial call yielded.
+                    // Release exit/output only after the initial exec_command yielded.
                     output_ready.notify_one();
                 }
                 EventMsg::ExecCommandEnd(event) if event.call_id == CALL_ID => {
@@ -1238,6 +1444,16 @@ timeout = 900
                 }
                 EventMsg::TurnAborted(_) if cancel_after_exit => {
                     turn_finished = true;
+                }
+                EventMsg::TurnComplete(_) if finish_at_deadline && !drain_poll_started => {
+                    timeout(STARTUP_TIMEOUT, drain_read_ready.notified()).await?;
+                    test.codex
+                        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                            text: "Poll the command.".into(),
+                            text_elements: Vec::new(),
+                        }]))
+                        .await?;
+                    drain_poll_started = true;
                 }
                 EventMsg::TurnComplete(_) if !cancel_after_exit => turn_finished = true,
                 _ => {}
@@ -1421,10 +1637,24 @@ timeout = 900
             "toolCallId": CALL_ID,
         }),
     );
+    if resumable_cancel {
+        assert_eq!(exec_server_result.process_read_requests, 1);
+        // The producer is closed without another poll; its unread output stays collectable.
+        assert!(
+            test.codex
+                .terminate_background_terminal(/*process_id*/ 1000)
+                .await
+        );
+    }
     if cancel_after_exit || terminate_after_exit {
         assert!(stopped);
-        assert_eq!(exec_server_result.process_read_requests, 0);
-        return Ok(());
+        assert_eq!(
+            exec_server_result.process_read_requests,
+            usize::from(resumable_cancel)
+        );
+        if !terminate_initial_collection {
+            return Ok(());
+        }
     }
     if foreign_cwd && !managed_network_configured && !deny_read {
         let permissions = response_mock.requests()[0]
@@ -1549,7 +1779,23 @@ timeout = 900
         assert_eq!(params["managedNetwork"], Value::Null);
         assert_eq!(params["env"]["HTTP_PROXY"], Value::Null);
         assert_eq!(params["networkProxy"]["proxy"]["enabled"], true);
+        assert_eq!(
+            params["networkProxy"]["proxy"]["credentialMasking"],
+            if matches!(
+                scenario,
+                PushedExecScenario::CredentialMasking
+                    | PushedExecScenario::CredentialMaskingUnsupportedShell
+            ) {
+                json!(true)
+            } else {
+                Value::Null
+            }
+        );
         assert_eq!(params["networkProxy"]["proxy"]["mode"], "full");
+        assert_eq!(
+            params["networkProxy"]["proxy"]["credentialProviders"],
+            Value::Null
+        );
         assert_eq!(
             params["networkProxy"]["policyDecisionTimeoutMs"].as_u64(),
             policy_callbacks.then_some(1_000_000)
@@ -1563,6 +1809,51 @@ timeout = 900
         })
         .await
         .context("model should receive the remote exec output")?;
+        if matches!(
+            scenario,
+            PushedExecScenario::CredentialMaskingUnsupportedShell
+                | PushedExecScenario::CredentialMaskingUnsupported
+                | PushedExecScenario::CredentialMaskingCustomProvidersUnsupported
+        ) {
+            let shell = if matches!(
+                scenario,
+                PushedExecScenario::CredentialMaskingUnsupportedShell
+            ) {
+                "/bin/sh"
+            } else {
+                "/bin/bash"
+            };
+            assert_eq!(params["argv"], json!([shell, "-lc", "pwd"]));
+            let warning = core_test_support::wait_for_event(&test.codex, |event| {
+                matches!(event, EventMsg::Warning(warning) if warning.message.starts_with("Credential masking is unavailable"))
+            })
+            .await;
+            let EventMsg::Warning(warning) = warning else {
+                unreachable!("waited for a credential masking warning")
+            };
+            if matches!(
+                scenario,
+                PushedExecScenario::CredentialMaskingUnsupportedShell
+            ) {
+                insta::assert_snapshot!(warning.message, @"Credential masking is unavailable for shell `sh` on environment `remote`. This command will run with unmasked credentials.");
+            } else if matches!(
+                scenario,
+                PushedExecScenario::CredentialMaskingCustomProvidersUnsupported
+            ) {
+                insta::assert_snapshot!(warning.message, @"Credential masking is unavailable for this network proxy configuration on environment `remote`. This command will run with unmasked credentials.");
+            } else {
+                insta::assert_snapshot!(warning.message, @"Credential masking is unavailable on environment `remote` because its exec-server does not support it. This command will run with unmasked credentials.");
+            }
+            let request = response_mock
+                .last_request()
+                .context("remote exec response")?;
+            assert!(
+                request
+                    .function_call_output_text(CALL_ID)
+                    .context("remote exec output")?
+                    .contains(COMPLETE_OUTPUT)
+            );
+        }
         return Ok(());
     }
     if matches!(managed_network, ManagedNetworkScenario::Disabled) {
@@ -1575,15 +1866,15 @@ timeout = 900
     let request = response_mock
         .last_request()
         .context("model should receive the exec_command output")?;
-    let output_call_id = if finish_at_final_poll {
-        let (initial_output, _) = request
+    let output_call_id = if output_after_yield || finish_at_final_poll || finish_at_deadline {
+        let (initial, _) = request
             .function_call_output_content_and_success(CALL_ID)
-            .context("initial exec_command should yield a session")?;
-        assert!(
-            initial_output
-                .context("initial exec_command output should contain text")?
-                .contains("Process running with session ID 1000")
-        );
+            .context("initial collection")?;
+        let initial = initial.context("initial output")?;
+        assert!(initial.contains("Process running with session ID 1000"));
+        if output_after_yield {
+            assert!(initial.contains("pushed "));
+        }
         assert!(
             !test
                 .codex
@@ -1594,6 +1885,14 @@ timeout = 900
     } else {
         CALL_ID
     };
+    if finish_at_deadline {
+        let (pending, _) = request
+            .function_call_output_content_and_success(DRAIN_POLL_CALL_ID)
+            .context("poll during the final read should yield")?;
+        let pending = pending.context("poll should contain buffered output")?;
+        assert!(pending.contains("Process running with session ID 1000"));
+        assert!(pending.contains("pushed "));
+    }
     let (output, success) = request
         .function_call_output_content_and_success(output_call_id)
         .context("exec_command output should be model visible")?;
@@ -1605,12 +1904,18 @@ timeout = 900
         | PushedExecScenario::OutputOpenAtDeadline
         | PushedExecScenario::OutputOpenAtFinalPoll
         | PushedExecScenario::OutputOpenWhenCancelled
-        | PushedExecScenario::OutputOpenWhenTerminated => {
+        | PushedExecScenario::OutputOpenWhenResumableCancelled
+        | PushedExecScenario::OutputOpenWhenTerminated
+        | PushedExecScenario::OutputOpenWhenTerminatedBeforeYield => {
             assert_ne!(success, Some(false));
             assert!(saw_exec_command_begin);
             assert!(output.contains("Process exited with code 0"));
             assert!(
-                output.contains(COMPLETE_OUTPUT),
+                output.contains(if output_after_yield || finish_at_deadline {
+                    "remote output\n"
+                } else {
+                    COMPLETE_OUTPUT
+                }),
                 "missing remote output tail: {output}"
             );
             assert_eq!(
@@ -1618,10 +1923,15 @@ timeout = 900
                 usize::from(matches!(
                     scenario,
                     PushedExecScenario::OutputAfterRecoveredExit
+                        | PushedExecScenario::OutputOpenAtDeadline
                 ))
             );
         }
         PushedExecScenario::Complete
+        | PushedExecScenario::CredentialMasking
+        | PushedExecScenario::CredentialMaskingCustomProvidersUnsupported
+        | PushedExecScenario::CredentialMaskingUnsupportedShell
+        | PushedExecScenario::CredentialMaskingUnsupported
         | PushedExecScenario::DenyWin
         | PushedExecScenario::DenyWinUnchanged
         | PushedExecScenario::DenyOldLinux
@@ -1642,7 +1952,7 @@ timeout = 900
         PushedExecScenario::RejectedLongWindowsDangerousCommand => {
             unreachable!("dangerous command returned early")
         }
-        PushedExecScenario::DirectDenied => {
+        PushedExecScenario::DirectDenied { .. } => {
             assert!(!saw_exec_command_begin);
             assert!(output.contains("Process exited with code 1"));
             assert_eq!(process_read_requests, 0, "unexpected compatibility read");
@@ -1676,3 +1986,6 @@ timeout = 900
 
 #[path = "network_approval_completion.rs"]
 mod network_approval_completion;
+
+#[path = "guardian_sandbox_retry.rs"]
+mod guardian_sandbox_retry;
