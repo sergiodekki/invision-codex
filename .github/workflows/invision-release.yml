@@ -1,5 +1,10 @@
 # Invision: compila o binário Linux (glibc, imagem Debian do app) e publica como release.
 # glibc porque o codex-code-mode-host embute V8, que não tem build pronto para musl.
+#
+# A Invision fixa a versão usada pela tag (`CODEX_RELEASE` no Dockerfile dela), nunca pela `latest`.
+# - push na main: release normal.
+# - workflow_dispatch em outro ramo (ex.: juntar o upstream): pré-release, sem virar a `latest`.
+#   A Invision só passa a usar depois do teste de contrato e de trocar a tag no Dockerfile.
 name: invision-release
 on:
   push:
@@ -9,6 +14,31 @@ on:
 permissions:
   contents: write
 jobs:
+  # Testes do provedor e do app-server (o protocolo que a Invision fala). Rodam junto com o build.
+  tests:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust (glibc)
+        working-directory: codex-rs
+        run: |
+          sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+          rustup show
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: codex-rs, prefix-key: v2-gnu-2204-tests }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - uses: ./.github/actions/setup-rusty-v8
+        with: { target: x86_64-unknown-linux-gnu }
+      - uses: taiki-e/install-action@v2
+        with: { tool: nextest }
+      - name: Testes do provedor Invision e do protocolo
+        working-directory: codex-rs
+        run: cargo nextest run --no-fail-fast -p codex-model-provider-info -p codex-app-server-protocol
+      - name: Testes do app-server
+        working-directory: codex-rs
+        run: cargo nextest run --no-fail-fast -p codex-app-server
   build:
     runs-on: ubuntu-22.04
     timeout-minutes: 120
@@ -45,6 +75,7 @@ jobs:
         env: { GH_TOKEN: "${{ github.token }}" }
         run: |
           TAG="invision-$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then FLAGS="--latest"; else FLAGS="--prerelease --latest=false"; fi
           cp codex-rs/target/x86_64-unknown-linux-gnu/release/codex codex-invision-linux-x64
           cp codex-rs/target/x86_64-unknown-linux-gnu/release/codex-code-mode-host codex-code-mode-host-linux-x64
-          gh release create "$TAG" codex-invision-linux-x64 codex-code-mode-host-linux-x64 SHA256SUMS --title "$TAG" --notes "Build Invision de ${GITHUB_SHA} (x86_64-unknown-linux-gnu)" --latest
+          gh release create "$TAG" codex-invision-linux-x64 codex-code-mode-host-linux-x64 SHA256SUMS --title "$TAG" --target "$GITHUB_SHA" --notes "Build Invision de ${GITHUB_SHA} (${GITHUB_REF_NAME}, x86_64-unknown-linux-gnu)" $FLAGS
