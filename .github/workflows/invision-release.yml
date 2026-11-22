@@ -11,6 +11,11 @@ on:
     branches: [main]
     paths: ["codex-rs/**", ".github/workflows/invision-release.yml"]
   workflow_dispatch:
+    inputs:
+      so_testes:
+        description: "Só os testes, sem montar nem publicar release"
+        type: boolean
+        default: false
 permissions:
   contents: write
 jobs:
@@ -36,10 +41,25 @@ jobs:
       - name: Testes do provedor Invision e do protocolo
         working-directory: codex-rs
         run: cargo nextest run --no-fail-fast -p codex-model-provider-info -p codex-app-server-protocol
+      # Mesma preparação do CI do upstream (rust-ci-full-nextest-platform.yml): binários que os testes chamam
+      # (codex, code-mode-host, sandbox, servidores MCP de teste), pilha de 8 MiB e o ajudante de sandbox.
+      - name: Binários auxiliares dos testes
+        working-directory: codex-rs
+        run: |
+          sudo apt-get install -y bubblewrap
+          cargo build -p codex-cli --bin codex -p codex-code-mode-host --bin codex-code-mode-host -p codex-linux-sandbox --bin codex-linux-sandbox -p codex-rmcp-client --bins
       - name: Testes do app-server
         working-directory: codex-rs
-        run: cargo nextest run --no-fail-fast -p codex-app-server
+        env:
+          RUST_BACKTRACE: 1
+          RUST_LIB_BACKTRACE: "0"
+          RUST_MIN_STACK: "8388608"
+        run: |
+          helper="$PWD/target/debug/codex-linux-sandbox"
+          env "CARGO_BIN_EXE_codex-linux-sandbox=$helper" "CARGO_BIN_EXE_codex_linux_sandbox=$helper" \
+            cargo nextest run --no-fail-fast -p codex-app-server
   build:
+    if: ${{ !inputs.so_testes }}
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     steps:
