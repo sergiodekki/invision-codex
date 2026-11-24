@@ -1,6 +1,7 @@
 //! Entry points for the configuration browser and its existing child editors.
 
 use super::ChatWidget;
+use crate::activation_key_guard::ActivationKeySuppression;
 use crate::config_panel::ConfigEditor;
 use crate::config_panel::ConfigEditorHandoff;
 use crate::config_panel::ConfigPanel;
@@ -26,6 +27,23 @@ impl ChatWidget {
         resume_current_availability: crate::config_panel::ResumeCurrentAvailability,
     ) {
         match handoff.editor {
+            ConfigEditor::ModelProviders => {
+                let (view, event) = crate::app::provider::loading();
+                self.bottom_pane.show_selection_view(view);
+                self.app_event_tx
+                    .send(crate::app_event::AppEvent::Provider(event));
+            }
+            ConfigEditor::ReasoningSummary => {
+                let Some((backend, summary)) = self.config_panel_reasoning_summary else {
+                    self.config_editor_open_failed("Reasoning summary is unavailable.".into());
+                    return;
+                };
+                let keymap = self.bottom_pane.list_keymap();
+                self.bottom_pane
+                    .show_selection_view(crate::config_panel::reasoning_summary(
+                        summary, backend, &keymap,
+                    ));
+            }
             ConfigEditor::Theme => self.open_theme_picker(),
             ConfigEditor::Effects => {
                 let keymap = self.bottom_pane.list_keymap();
@@ -35,6 +53,12 @@ impl ChatWidget {
             ConfigEditor::StatusLine => self.open_status_line_setup(),
             ConfigEditor::TerminalTitle => self.open_terminal_title_setup(),
             ConfigEditor::Keyboard => self.open_keymap_picker(),
+            ConfigEditor::MouseScrollSpeed => {
+                let keymap = self.bottom_pane.list_keymap();
+                let params =
+                    crate::config_panel::mouse_scroll_speed(&self.config_panel_tui, &keymap);
+                self.bottom_pane.show_selection_view(params);
+            }
             ConfigEditor::SessionPickerLayout => {
                 let keymap = self.bottom_pane.list_keymap();
                 let params =
@@ -69,8 +93,11 @@ impl ChatWidget {
             }
         }
         if let Some(activated_at) = handoff.active_at() {
-            self.bottom_pane
-                .suppress_current_view_key_until_release(handoff.activation_key, activated_at);
+            self.suppress_current_view_key_until_release(
+                handoff.activation_key,
+                activated_at,
+                ActivationKeySuppression::ViewTransition,
+            );
         }
         self.bottom_pane.config_editor_opened();
     }
@@ -99,11 +126,14 @@ impl ChatWidget {
             ConfigToggle::PasteDetection => self.bottom_pane.set_disable_paste_burst(
                 /*disabled*/ tui.disable_paste_burst.unwrap_or(/*default*/ false),
             ),
+            ConfigToggle::StatusLineColors => {
+                self.status_surface_overrides.status_line_use_colors = None;
+            }
             ConfigToggle::AutomaticRecaps
+            | ConfigToggle::CollapseTurnDetails
             | ConfigToggle::CopyOnSelectClearSelection
             | ConfigToggle::Notifications
             | ConfigToggle::StartInVimMode
-            | ConfigToggle::StatusLineColors
             | ConfigToggle::Tips => {}
         }
         if setting == ConfigToggle::Animations
@@ -119,6 +149,51 @@ impl ChatWidget {
     }
 
     pub(crate) fn refresh_config_panel(&mut self, notice: Option<String>) -> bool {
+        self.refresh_config_panel_with_effects_state(notice, Vec::new())
+    }
+
+    /// Refresh after an effective save without discarding newer Effects choices still queued.
+    pub(crate) fn refresh_config_panel_after_effective_save(
+        &mut self,
+        notice: Option<String>,
+        preference: ConfigPreference,
+    ) -> bool {
+        if let ConfigPreference::Toggle { setting, .. } = preference {
+            match setting {
+                ConfigToggle::Animations => {
+                    self.bottom_pane.complete_selection_toggle_for_active_view(
+                        crate::config_panel::EFFECTS_VIEW_ID,
+                        /*index*/ 0,
+                    );
+                }
+                ConfigToggle::ComposerStars => {
+                    self.bottom_pane.complete_selection_toggle_for_active_view(
+                        crate::config_panel::EFFECTS_VIEW_ID,
+                        /*index*/ 1,
+                    );
+                }
+                ConfigToggle::AutomaticRecaps
+                | ConfigToggle::CollapseTurnDetails
+                | ConfigToggle::CopyOnSelectClearSelection
+                | ConfigToggle::Notifications
+                | ConfigToggle::PasteDetection
+                | ConfigToggle::StartInVimMode
+                | ConfigToggle::StatusLineColors
+                | ConfigToggle::Tips => {}
+            }
+        }
+        let toggle_states = self
+            .bottom_pane
+            .selection_toggle_states_for_active_view(crate::config_panel::EFFECTS_VIEW_ID)
+            .unwrap_or_default();
+        self.refresh_config_panel_with_effects_state(notice, toggle_states)
+    }
+
+    fn refresh_config_panel_with_effects_state(
+        &mut self,
+        notice: Option<String>,
+        effects_toggle_states: Vec<Option<crate::bottom_pane::SelectionToggleState>>,
+    ) -> bool {
         let panel_updated = self.bottom_pane.update_config_panel(&ConfigPanelUpdate {
             tui: self.config_panel_tui.clone(),
             keymap: self.bottom_pane.list_keymap(),
@@ -132,7 +207,11 @@ impl ChatWidget {
             return panel_updated;
         };
         let keymap = self.bottom_pane.list_keymap();
-        let mut params = crate::config_panel::effects(&self.config_panel_tui, &keymap);
+        let mut params = crate::config_panel::effects_with_toggle_states(
+            &self.config_panel_tui,
+            &keymap,
+            &effects_toggle_states,
+        );
         params.initial_selected_idx = Some(selected_idx);
         params.subtitle = notice.or(params.subtitle);
         let effects_updated = self
@@ -143,6 +222,7 @@ impl ChatWidget {
 
     fn config_panel_status(&self) -> ConfigPanelStatus {
         ConfigPanelStatus {
+            transcript_mode: self.local_settings.transcript_mode,
             copy_on_select: self
                 .local_settings
                 .copy_on_select(&codex_terminal_detection::terminal_info()),
@@ -151,6 +231,10 @@ impl ChatWidget {
                 self.local_settings.transcript_mode,
             ),
             custom_notification_filters: self.local_settings.custom_notification_filters,
+            reasoning_summary: self
+                .config_panel_reasoning_summary
+                .map(|(_, summary)| summary)
+                .ok_or("Reconnect or update the connected server to change this setting"),
         }
     }
 

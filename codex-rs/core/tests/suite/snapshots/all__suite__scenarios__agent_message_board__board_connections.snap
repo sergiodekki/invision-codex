@@ -76,14 +76,16 @@ Scenario: Independent Codex runtimes share a local board: a writer publishes, an
     Publish an update.
 -- request 14 (request) --
 08:function_call/collaboration.post:{"agents_to_notify":["/root/00000000000040008000000000000002"],"channel_name":"policy","text":"Must not publish"}
-09:function_call/collaboration.post:{"channel_name":"policy","text":"A new policy"}
-10:function_call/collaboration.post:{"agents_to_notify":["/root/00000000000040008000000000000001"],"channel_name":"policy","text":"An explicit update"}
-11:function_call_output:no thread with id: <UUID 4>
-12:function_call_output:{"author":"/root/00000000000040008000000000000000","channel_name":"policy","created_at":"2026-09-18T12:00:00Z","message_id":"<UUID 5>","thread_id":"<UUID 5>"}
+09:function_call_output:no thread with id: <UUID 4>
+-- request 15 (request) --
+10:function_call/collaboration.post:{"channel_name":"policy","text":"A new policy"}
+11:function_call_output:{"author":"/root/00000000000040008000000000000000","channel_name":"policy","created_at":"2026-09-18T12:00:00Z","message_id":"<UUID 5>","thread_id":"<UUID 5>"}
+-- request 16 (request) --
+12:function_call/collaboration.post:{"agents_to_notify":["/root/00000000000040008000000000000001"],"channel_name":"policy","text":"An explicit update"}
 13:function_call_output:{"author":"/root/00000000000040008000000000000000","channel_name":"policy","created_at":"2026-09-18T12:00:00Z","message_id":"<UUID 6>","thread_id":"<UUID 6>"}
 
-## Window 4 (after request 14: input diverged at item 04, settings changed (prompt_cache_key))
--- request 15 (request) --
+## Window 4 (after request 16: input diverged at item 04, settings changed (prompt_cache_key))
+-- request 17 (request) --
 00:message/developer:
     <MODEL_INSTRUCTIONS>
 01:message/developer:
@@ -114,7 +116,8 @@ Scenario: Independent Codex runtimes share a local board: a writer publishes, an
 21:function_call_output:{"channel_name":"policy","enabled":true,"last_message_id":"<UUID 1>","target_agent":"/root/00000000000040008000000000000001","thread_id":null}
 22:message/assistant:
     Watching the policy board.
-23:function_call/collaboration.get_channels:{}
-24:function_call_output:{"board_permissions":{"create_channel":false,"edit_metadata":false,"manage_permissions":false},"has_more...ata":false,"post":false,"read":true,"reply":false}}]} [hash=7cc8dc25fc1c52b2]
-25:agent_message
-26:agent_message
+23:agent_message
+24:agent_message
+-- request 18 (request) --
+25:function_call/collaboration.get_channels:{}
+26:function_call_output:{"board_permissions":{"create_channel":false,"edit_metadata":false,"manage_permissions":false},"has_more...ata":false,"post":false,"read":true,"reply":false}}]} [hash=7cc8dc25fc1c52b2]

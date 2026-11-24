@@ -19,6 +19,8 @@ use crate::bottom_pane::SelectionDescriptionLayout;
 use crate::bottom_pane::SelectionItem;
 use crate::bottom_pane::SelectionRowDisplay;
 use crate::bottom_pane::SelectionTab;
+use crate::bottom_pane::SelectionToggle;
+use crate::bottom_pane::SelectionToggleState;
 use crate::bottom_pane::SelectionViewParams;
 use crate::bottom_pane::footer_hint_items_line;
 use crate::bottom_pane::popup_consts::picker_hint_line_for_keymap;
@@ -34,13 +36,63 @@ use ratatui::layout::Rect;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 use unicode_width::UnicodeWidthStr;
 
 pub(crate) const EFFECTS_VIEW_ID: &str = "config-effects";
 
+pub(crate) fn reasoning_summary(
+    configured: Option<codex_protocol::config_types::ReasoningSummary>,
+    backend: crate::backend_id::BackendId,
+    keymap: &ListKeymap,
+) -> SelectionViewParams {
+    use codex_protocol::config_types::ReasoningSummary;
+
+    let current = configured.unwrap_or(ReasoningSummary::Auto);
+    let choices = [
+        ReasoningSummary::Auto,
+        ReasoningSummary::Concise,
+        ReasoningSummary::Detailed,
+        ReasoningSummary::None,
+    ];
+    SelectionViewParams {
+        title: Some("Reasoning summary".into()),
+        subtitle: Some("Choose the reasoning summary style for new chats".into()),
+        footer_hint: Some(picker_hint_line_for_keymap(keymap)),
+        initial_selected_idx: choices.iter().position(|choice| *choice == current),
+        allow_input_when_disconnected: true,
+        items: choices
+            .into_iter()
+            .map(|choice| SelectionItem {
+                name: super::reasoning_summary_label(if choice == current {
+                    configured
+                } else {
+                    Some(choice)
+                })
+                .into(),
+                is_current: choice == current,
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::SaveReasoningSummary {
+                        backend,
+                        summary: choice,
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            })
+            .collect(),
+        ..SelectionViewParams::picker()
+    }
+}
+
 pub(crate) fn effects(tui: &codex_config::types::Tui, keymap: &ListKeymap) -> SelectionViewParams {
+    effects_with_toggle_states(tui, keymap, &[])
+}
+
+pub(crate) fn effects_with_toggle_states(
+    tui: &codex_config::types::Tui,
+    keymap: &ListKeymap,
+    toggle_states: &[Option<SelectionToggleState>],
+) -> SelectionViewParams {
     let footer_hint = [(ListAction::Accept, "toggle"), (ListAction::Cancel, "back")]
         .into_iter()
         .filter_map(|(action, label)| {
@@ -61,6 +113,12 @@ pub(crate) fn effects(tui: &codex_config::types::Tui, keymap: &ListKeymap) -> Se
             ConfigToggle::ComposerStars,
         ),
     ];
+    let animations_enabled = toggle_states
+        .first()
+        .copied()
+        .flatten()
+        .map(|state| state.is_on)
+        .unwrap_or(tui.animations);
     SelectionViewParams {
         view_id: Some(EFFECTS_VIEW_ID),
         title: Some("Effects".to_string()),
@@ -69,31 +127,76 @@ pub(crate) fn effects(tui: &codex_config::types::Tui, keymap: &ListKeymap) -> Se
         allow_input_when_disconnected: true,
         items: settings
             .into_iter()
-            .map(|(label, description, setting)| {
-                let enabled = setting.enabled(tui);
-                let next_enabled = AtomicBool::new(!enabled);
-                let available = setting != ConfigToggle::ComposerStars || tui.animations;
+            .enumerate()
+            .map(|(index, (label, description, setting))| {
+                let toggle_state = toggle_states.get(index).copied().flatten();
+                let enabled = toggle_state
+                    .map(|state| state.is_on)
+                    .unwrap_or_else(|| setting.enabled(tui));
+                let available = setting != ConfigToggle::ComposerStars || animations_enabled;
                 SelectionItem {
                     name: label.to_string(),
-                    toggle_placeholder: Some(if !available {
-                        SELECTION_TOGGLE_UNAVAILABLE_PREFIX
-                    } else if enabled {
-                        "[x] "
-                    } else {
-                        "[ ] "
+                    toggle: Some(SelectionToggle {
+                        is_on: enabled,
+                        action: Box::new(move |enabled, tx| {
+                            tx.send(AppEvent::SaveConfigPreference(ConfigPreference::Toggle {
+                                setting,
+                                enabled,
+                            }));
+                        }),
                     }),
+                    pending_toggle_actions: toggle_state
+                        .map(|state| state.pending_actions)
+                        .unwrap_or_default(),
+                    checkbox_toggle: available,
+                    toggle_placeholder: (!available).then_some(SELECTION_TOGGLE_UNAVAILABLE_PREFIX),
                     description: available.then(|| description.to_string()),
                     disabled_reason: (!available)
                         .then(|| "Turn on Animations to show Astra task stars".to_string()),
-                    actions: vec![Box::new(move |tx| {
-                        tx.send(AppEvent::SaveConfigPreference(ConfigPreference::Toggle {
-                            setting,
-                            enabled: next_enabled.fetch_xor(/*val*/ true, Ordering::Relaxed),
-                        }));
-                    })],
                     dismiss_on_select: false,
                     ..Default::default()
                 }
+            })
+            .collect(),
+        ..SelectionViewParams::picker()
+    }
+}
+
+pub(crate) fn mouse_scroll_speed(
+    tui: &codex_config::types::Tui,
+    keymap: &ListKeymap,
+) -> SelectionViewParams {
+    let current = tui.mouse_scroll_speed.unwrap_or(1.0);
+    let mut speeds = vec![0.5, 1.0, 1.5, 2.0, 3.0];
+    let selected = match speeds.binary_search_by(|speed: &f64| speed.total_cmp(&current)) {
+        Ok(index) => index,
+        Err(index) => {
+            speeds.insert(index, current);
+            index
+        }
+    };
+    SelectionViewParams {
+        title: Some("Mouse scroll speed".to_string()),
+        subtitle: Some("Choose a mouse-wheel speed for the fullscreen transcript".to_string()),
+        footer_hint: Some(picker_hint_line_for_keymap(keymap)),
+        initial_selected_idx: Some(selected),
+        allow_input_when_disconnected: true,
+        items: speeds
+            .into_iter()
+            .map(|speed| SelectionItem {
+                name: if speed == 1.0 {
+                    "1× (default)".to_string()
+                } else {
+                    format!("{speed}×")
+                },
+                is_current: speed == current,
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::SaveConfigPreference(
+                        ConfigPreference::MouseScrollSpeed(speed),
+                    ));
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
             })
             .collect(),
         ..SelectionViewParams::picker()
@@ -154,7 +257,7 @@ pub(crate) fn copy_on_select(
     SelectionViewParams {
         title: Some("Copy on select".to_string()),
         subtitle: Some(
-            "Copy transcript selections on release, with Auto following terminal defaults"
+            "Copy transcript, footer, and composer selections on release; Auto follows terminal defaults"
                 .to_string(),
         ),
         footer_hint: Some(picker_hint_line_for_keymap(keymap)),
