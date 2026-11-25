@@ -36,6 +36,12 @@ jobs:
         with: { python-version: "3.12" }
       - uses: ./.github/actions/setup-rusty-v8
         with: { target: x86_64-unknown-linux-gnu }
+      # Cache parcial do rust-cache marca o v8 como compilado sem guardar o librusty_v8.a
+      # ("could not find native static library rusty_v8", 25/11): refaz o script do v8, que só
+      # desempacota o arquivo pronto e conferido acima.
+      - name: Refaz o v8 a partir do arquivo pronto
+        working-directory: codex-rs
+        run: rm -rf target/*/build/v8-* target/*/.fingerprint/v8-* target/*/*/build/v8-* target/*/*/.fingerprint/v8-*
       - uses: taiki-e/install-action@v2
         with: { tool: nextest }
       - name: Testes do provedor Invision e do protocolo
@@ -79,6 +85,10 @@ jobs:
         with: { python-version: "3.12" }
       - uses: ./.github/actions/setup-rusty-v8
         with: { target: x86_64-unknown-linux-gnu }
+      # Mesmo motivo do job de testes: o cache parcial não guarda o librusty_v8.a.
+      - name: Refaz o v8 a partir do arquivo pronto
+        working-directory: codex-rs
+        run: rm -rf target/*/build/v8-* target/*/.fingerprint/v8-* target/*/*/build/v8-* target/*/*/.fingerprint/v8-*
       - name: Build
         working-directory: codex-rs
         run: |
