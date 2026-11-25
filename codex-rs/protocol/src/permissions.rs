@@ -53,12 +53,24 @@ const PROTECTED_METADATA_AGENTS_PATH_NAME: &str = ".agents";
 const PROTECTED_METADATA_CODEX_PATH_NAME: &str = ".codex";
 const PROTECTED_METADATA_AWS_PATH_NAME: &str = ".aws";
 
+/// Invision: project config that another tool on the host executes later (hooks, MCP servers,
+/// auto-run tasks). A hook planted in `.claude/settings.json` ran on the host the next time Claude
+/// Code opened the project (CVE-2026-25725); `.vscode`, `.cursor` and `.gemini` carry MCP servers
+/// and tasks the same way, and `.invision` is the desktop app's own project config.
+pub(crate) const INVISION_HOST_EXECUTED_CONFIG_PATH_NAMES: &[&str] =
+    &[".claude", ".cursor", ".gemini", ".vscode", ".invision"];
+
 /// Top-level workspace metadata paths that stay protected under writable roots.
 pub const PROTECTED_METADATA_PATH_NAMES: &[&str] = &[
     PROTECTED_METADATA_GIT_PATH_NAME,
     PROTECTED_METADATA_AGENTS_PATH_NAME,
     PROTECTED_METADATA_CODEX_PATH_NAME,
     PROTECTED_METADATA_AWS_PATH_NAME,
+    ".claude",
+    ".cursor",
+    ".gemini",
+    ".vscode",
+    ".invision",
 ];
 
 /// Returns true when a path basename is one of the protected workspace metadata names.
@@ -892,6 +904,9 @@ impl FileSystemSandboxPolicy {
         append_default_read_only_project_root_subpath_if_no_explicit_rule(&mut entries, ".agents");
         append_default_read_only_project_root_subpath_if_no_explicit_rule(&mut entries, ".codex");
         append_default_read_only_project_root_subpath_if_no_explicit_rule(&mut entries, ".aws");
+        for name in INVISION_HOST_EXECUTED_CONFIG_PATH_NAMES {
+            append_default_read_only_project_root_subpath_if_no_explicit_rule(&mut entries, *name);
+        }
         Self::restricted(entries)
     }
 
@@ -2432,6 +2447,15 @@ pub(crate) fn default_read_only_subpaths_for_writable_root(
     let top_level_aws = writable_root.join(PROTECTED_METADATA_AWS_PATH_NAME);
     if top_level_aws.as_path().is_dir() {
         subpaths.push(top_level_aws);
+    }
+
+    // Invision: like `.codex`, protect these even before they exist at the workspace root, so a
+    // first-time creation (the planted-hook case) still goes through the approval flow.
+    for name in INVISION_HOST_EXECUTED_CONFIG_PATH_NAMES {
+        let top_level = writable_root.join(name);
+        if protect_missing_dot_codex || top_level.as_path().exists() {
+            subpaths.push(top_level);
+        }
     }
 
     dedup_absolute_paths(subpaths, /*normalize_effective_paths*/ false)

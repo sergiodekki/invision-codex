@@ -3089,6 +3089,7 @@ dependencies = [
  "codex-http-client",
  "codex-image-generation-extension",
  "codex-install-context",
+ "codex-invision-prompt-mask",
  "codex-login",
  "codex-mcp",
  "codex-mcp-extension",
@@ -4100,6 +4101,15 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "codex-invision-prompt-mask"
+version = "0.0.0"
+dependencies = [
+ "codex-protocol",
+ "pretty_assertions",
+ "serde_json",
 ]
 
 [[package]]

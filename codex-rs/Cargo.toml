@@ -15,6 +15,7 @@ members = [
     "attachment-store",
     "async-utils",
     "app-server",
+    "invision-prompt-mask",
     "app-server-transport",
     "app-server-daemon",
     "app-server-client",
@@ -293,6 +294,7 @@ codex-plugin = { path = "plugin" }
 codex-model-provider = { path = "model-provider" }
 codex-process-hardening = { path = "process-hardening" }
 codex-protocol = { path = "protocol" }
+codex-invision-prompt-mask = { path = "invision-prompt-mask" }
 codex-protocol-test-support = { path = "protocol/tests/support" }
 codex-prompts = { path = "prompts" }
 codex-queue-extension = { path = "ext/queue" }

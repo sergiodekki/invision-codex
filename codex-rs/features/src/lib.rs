@@ -143,6 +143,8 @@ pub enum Feature {
     StableEnvironmentTools,
     /// Copy files between explicitly selected execution environments.
     MultiEnvCopyFile,
+    /// Invision: mask old, large tool outputs in the prompt (whole steps, cache-stable).
+    MaskOldToolOutputs,
     /// Send per-content-entry classifications in internal Responses metadata.
     ContentItemKinds,
     /// Render client-supplied untrusted context as standalone named tool outputs.
@@ -1236,6 +1238,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::MultiEnvCopyFile,
         key: "multi_env_copy_file",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::MaskOldToolOutputs,
+        key: "mask_old_tool_outputs",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },

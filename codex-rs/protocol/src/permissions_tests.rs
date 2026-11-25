@@ -707,46 +707,59 @@ fn legacy_workspace_write_projection_preserves_symbolic_project_root() {
 
     assert_eq!(
         FileSystemSandboxPolicy::from(&policy),
-        FileSystemSandboxPolicy::restricted(vec![
-            FileSystemSandboxEntry {
-                path: FileSystemPath::Special {
-                    value: FileSystemSpecialPath::Root,
+        FileSystemSandboxPolicy::restricted(
+            vec![
+                FileSystemSandboxEntry {
+                    path: FileSystemPath::Special {
+                        value: FileSystemSpecialPath::Root,
+                    },
+                    access: FileSystemAccessMode::Read,
+                    missing_path_behavior: None,
                 },
-                access: FileSystemAccessMode::Read,
-                missing_path_behavior: None,
-            },
-            FileSystemSandboxEntry {
-                path: FileSystemPath::Special {
-                    value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+                FileSystemSandboxEntry {
+                    path: FileSystemPath::Special {
+                        value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+                    },
+                    access: FileSystemAccessMode::Write,
+                    missing_path_behavior: None,
                 },
-                access: FileSystemAccessMode::Write,
-                missing_path_behavior: None,
-            },
-            FileSystemSandboxEntry::skip_missing_path(
-                FileSystemPath::Special {
-                    value: FileSystemSpecialPath::project_roots(Some(".git".into())),
-                },
-                FileSystemAccessMode::Read,
-            ),
-            FileSystemSandboxEntry::skip_missing_path(
-                FileSystemPath::Special {
-                    value: FileSystemSpecialPath::project_roots(Some(".agents".into())),
-                },
-                FileSystemAccessMode::Read,
-            ),
-            FileSystemSandboxEntry::skip_missing_path(
-                FileSystemPath::Special {
-                    value: FileSystemSpecialPath::project_roots(Some(".codex".into())),
-                },
-                FileSystemAccessMode::Read,
-            ),
-            FileSystemSandboxEntry::skip_missing_path(
-                FileSystemPath::Special {
-                    value: FileSystemSpecialPath::project_roots(Some(".aws".into())),
-                },
-                FileSystemAccessMode::Read,
-            ),
-        ])
+                FileSystemSandboxEntry::skip_missing_path(
+                    FileSystemPath::Special {
+                        value: FileSystemSpecialPath::project_roots(Some(".git".into())),
+                    },
+                    FileSystemAccessMode::Read,
+                ),
+                FileSystemSandboxEntry::skip_missing_path(
+                    FileSystemPath::Special {
+                        value: FileSystemSpecialPath::project_roots(Some(".agents".into())),
+                    },
+                    FileSystemAccessMode::Read,
+                ),
+                FileSystemSandboxEntry::skip_missing_path(
+                    FileSystemPath::Special {
+                        value: FileSystemSpecialPath::project_roots(Some(".codex".into())),
+                    },
+                    FileSystemAccessMode::Read,
+                ),
+                FileSystemSandboxEntry::skip_missing_path(
+                    FileSystemPath::Special {
+                        value: FileSystemSpecialPath::project_roots(Some(".aws".into())),
+                    },
+                    FileSystemAccessMode::Read,
+                ),
+            ]
+            .into_iter()
+            // Invision: host-executed tool config (`.claude`, `.cursor`, ...) is protected the same way.
+            .chain(INVISION_HOST_EXECUTED_CONFIG_PATH_NAMES.iter().map(|name| {
+                FileSystemSandboxEntry::skip_missing_path(
+                    FileSystemPath::Special {
+                        value: FileSystemSpecialPath::project_roots(Some((*name).into())),
+                    },
+                    FileSystemAccessMode::Read,
+                )
+            }))
+            .collect()
+        )
     );
 }
 
@@ -824,6 +837,69 @@ fn writable_roots_skip_default_metadata_when_explicit_user_rule_exists() {
     }
 }
 
+// Invision: configuration that another tool on the host executes later (hooks, MCP servers,
+// tasks) must stay read-only inside the sandbox. A hook planted in `.claude/settings.json` ran on
+// the host the next time Claude Code opened the project (CVE-2026-25725); `.vscode`, `.cursor`
+// and `.gemini` carry MCP servers and auto-run tasks the same way.
+#[test]
+fn filesystem_policy_blocks_host_executed_tool_config_writes() {
+    let cwd = TempDir::new().expect("tempdir");
+    let root = AbsolutePathBuf::from_absolute_path(cwd.path()).expect("absolute cwd");
+    let file_system_policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+        path: root.into(),
+        access: FileSystemAccessMode::Write,
+        missing_path_behavior: None,
+    }]);
+
+    for path in [
+        cwd.path().join(".claude").join("settings.json"),
+        cwd.path().join(".claude").join("settings.local.json"),
+        cwd.path().join(".cursor").join("mcp.json"),
+        cwd.path().join(".gemini").join("settings.json"),
+        cwd.path().join(".vscode").join("tasks.json"),
+        cwd.path().join(".vscode").join("mcp.json"),
+        cwd.path().join(".invision").join("config.toml"),
+    ] {
+        assert!(
+            !file_system_policy.can_write_local_path_with_cwd(&path, cwd.path()),
+            "should be read-only: {}",
+            path.display()
+        );
+    }
+    assert!(
+        file_system_policy
+            .can_write_local_path_with_cwd(&cwd.path().join("src").join("main.rs"), cwd.path())
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn writable_roots_proactively_protect_missing_host_tool_configs() {
+    let cwd = TempDir::new().expect("tempdir");
+    let expected_root =
+        AbsolutePathBuf::from_absolute_path(cwd.path().canonicalize().expect("canonicalize cwd"))
+            .expect("absolute canonical root");
+
+    let policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+        path: FileSystemPath::Special {
+            value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+        },
+        access: FileSystemAccessMode::Write,
+        missing_path_behavior: None,
+    }]);
+
+    let writable_roots = policy.get_writable_roots_with_cwd(cwd.path());
+    assert_eq!(writable_roots.len(), 1);
+    for name in [".claude", ".cursor", ".gemini", ".vscode", ".invision"] {
+        assert!(
+            writable_roots[0]
+                .read_only_subpaths
+                .contains(&expected_root.join(name)),
+            "missing {name} must be protected before it is created"
+        );
+    }
+}
+
 #[test]
 fn filesystem_policy_blocks_protected_metadata_path_writes_by_default() {
     let cwd = TempDir::new().expect("tempdir");
@@ -852,6 +928,11 @@ fn filesystem_policy_blocks_protected_metadata_path_writes_by_default() {
             ".agents".to_string(),
             ".codex".to_string(),
             ".aws".to_string(),
+            ".claude".to_string(),
+            ".cursor".to_string(),
+            ".gemini".to_string(),
+            ".vscode".to_string(),
+            ".invision".to_string(),
         ]
     );
     assert!(!writable_roots[0].is_path_writable(&dot_git_config));
@@ -1477,7 +1558,14 @@ fn compatibility_writable_roots_preserve_the_output_only_fallback() -> io::Resul
             },
             WritableRoot {
                 root: cwd.clone(),
-                read_only_subpaths: vec![cwd.join(".codex")],
+                // Invision: like `.codex`, host-executed tool config is protected before it exists.
+                read_only_subpaths: std::iter::once(cwd.join(".codex"))
+                    .chain(
+                        INVISION_HOST_EXECUTED_CONFIG_PATH_NAMES
+                            .iter()
+                            .map(|name| cwd.join(name)),
+                    )
+                    .collect(),
                 protected_metadata_names: Vec::new(),
             },
         ]
@@ -1794,58 +1882,71 @@ fn workspace_write_with_extra_root_protects_metadata() {
 
     assert_eq!(
         actual,
-        FileSystemSandboxPolicy::restricted(vec![
-            FileSystemSandboxEntry::new(
-                FileSystemPath::Special {
-                    value: FileSystemSpecialPath::Root
+        FileSystemSandboxPolicy::restricted(
+            vec![
+                FileSystemSandboxEntry::new(
+                    FileSystemPath::Special {
+                        value: FileSystemSpecialPath::Root
+                    },
+                    FileSystemAccessMode::Read,
+                ),
+                FileSystemSandboxEntry {
+                    path: FileSystemPath::Special {
+                        value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+                    },
+                    access: FileSystemAccessMode::Write,
+                    missing_path_behavior: None,
                 },
-                FileSystemAccessMode::Read,
-            ),
-            FileSystemSandboxEntry {
-                path: FileSystemPath::Special {
-                    value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+                FileSystemSandboxEntry {
+                    path: FileSystemPath::Path {
+                        path: extra.clone().into()
+                    },
+                    access: FileSystemAccessMode::Write,
+                    missing_path_behavior: None,
                 },
-                access: FileSystemAccessMode::Write,
-                missing_path_behavior: None,
-            },
-            FileSystemSandboxEntry {
-                path: FileSystemPath::Path {
-                    path: extra.clone().into()
-                },
-                access: FileSystemAccessMode::Write,
-                missing_path_behavior: None,
-            },
-            FileSystemSandboxEntry::skip_missing_path(
-                FileSystemPath::Special {
-                    value: FileSystemSpecialPath::project_roots(Some(".git".to_string())),
-                },
-                FileSystemAccessMode::Read,
-            ),
-            FileSystemSandboxEntry::skip_missing_path(
-                FileSystemPath::Special {
-                    value: FileSystemSpecialPath::project_roots(Some(".agents".to_string())),
-                },
-                FileSystemAccessMode::Read,
-            ),
-            FileSystemSandboxEntry::skip_missing_path(
-                FileSystemPath::Special {
-                    value: FileSystemSpecialPath::project_roots(Some(".codex".to_string())),
-                },
-                FileSystemAccessMode::Read,
-            ),
-            FileSystemSandboxEntry::skip_missing_path(
-                FileSystemPath::Special {
-                    value: FileSystemSpecialPath::project_roots(Some(".aws".to_string())),
-                },
-                FileSystemAccessMode::Read,
-            ),
-            FileSystemSandboxEntry::skip_missing_path(
+                FileSystemSandboxEntry::skip_missing_path(
+                    FileSystemPath::Special {
+                        value: FileSystemSpecialPath::project_roots(Some(".git".to_string())),
+                    },
+                    FileSystemAccessMode::Read,
+                ),
+                FileSystemSandboxEntry::skip_missing_path(
+                    FileSystemPath::Special {
+                        value: FileSystemSpecialPath::project_roots(Some(".agents".to_string())),
+                    },
+                    FileSystemAccessMode::Read,
+                ),
+                FileSystemSandboxEntry::skip_missing_path(
+                    FileSystemPath::Special {
+                        value: FileSystemSpecialPath::project_roots(Some(".codex".to_string())),
+                    },
+                    FileSystemAccessMode::Read,
+                ),
+                FileSystemSandboxEntry::skip_missing_path(
+                    FileSystemPath::Special {
+                        value: FileSystemSpecialPath::project_roots(Some(".aws".to_string())),
+                    },
+                    FileSystemAccessMode::Read,
+                ),
+            ]
+            .into_iter()
+            // Invision: host-executed tool config (`.claude`, `.cursor`, ...) is protected the same way.
+            .chain(INVISION_HOST_EXECUTED_CONFIG_PATH_NAMES.iter().map(|name| {
+                FileSystemSandboxEntry::skip_missing_path(
+                    FileSystemPath::Special {
+                        value: FileSystemSpecialPath::project_roots(Some((*name).to_string())),
+                    },
+                    FileSystemAccessMode::Read,
+                )
+            }))
+            .chain([FileSystemSandboxEntry::skip_missing_path(
                 FileSystemPath::Path {
-                    path: extra.join(".git").into()
+                    path: extra.join(".git").into(),
                 },
                 FileSystemAccessMode::Read,
-            ),
-        ])
+            )])
+            .collect()
+        )
     );
 }
 
