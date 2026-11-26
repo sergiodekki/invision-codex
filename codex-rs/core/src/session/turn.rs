@@ -2162,6 +2162,18 @@ async fn run_sampling_request(
                 sess.services.image_store.as_ref(),
             )
             .await;
+        // Invision: old, large tool outputs go to the model as a short placeholder, in whole steps
+        // so the prompt prefix stays cache-stable (codex-invision-prompt-mask).
+        if turn_context
+            .config
+            .features
+            .enabled(Feature::MaskOldToolOutputs)
+        {
+            codex_invision_prompt_mask::mask_old_tool_outputs(
+                &mut prompt_input,
+                &codex_invision_prompt_mask::MaskPolicy::default(),
+            );
+        }
         sess.services
             .executed_tool_calls
             .attach_to_prompt(&mut prompt_input, &mut executed_tool_calls_by_output);

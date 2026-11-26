@@ -5719,13 +5719,20 @@ mod tests {
         assert_eq!(
             sorted_writable_roots(policy.get_writable_roots_with_cwd(cwd.path())),
             vec![
-                (
-                    canonical_cwd,
-                    vec![
+                (canonical_cwd.clone(), {
+                    // Invision: host-executed tool config is protected like `.codex`.
+                    let mut expected = vec![
                         expected_dot_codex.to_path_buf(),
-                        expected_docs.to_path_buf()
-                    ],
-                ),
+                        expected_docs.to_path_buf(),
+                    ];
+                    expected.extend(
+                        crate::permissions::INVISION_HOST_EXECUTED_CONFIG_PATH_NAMES
+                            .iter()
+                            .map(|name| canonical_cwd.join(name)),
+                    );
+                    expected.sort();
+                    expected
+                },),
                 (expected_docs_public.to_path_buf(), Vec::new()),
             ]
         );

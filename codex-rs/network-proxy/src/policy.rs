@@ -18,6 +18,14 @@ pub struct Host(String);
 
 impl Host {
     pub fn parse(input: &str) -> Result<Self> {
+        // Invision: a NUL or other control/delimiter byte must never reach the allowlist matcher.
+        // `evil.example\0.allowed.example` matched `*.allowed.example` while the system resolver
+        // stopped at the NUL and dialed `evil.example` (SOCKS5 bypass reported in 2026).
+        ensure!(
+            !input.chars().any(|c| c.is_ascii_control())
+                && !input.trim().chars().any(is_forbidden_host_char),
+            "host contains a forbidden character"
+        );
         let normalized = normalize_host(input);
         ensure!(!normalized.is_empty(), "host is empty");
         Ok(Self(normalized))
@@ -26,6 +34,13 @@ impl Host {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// Characters that can never appear in a host we hand to the matcher or the resolver: ASCII
+/// controls (NUL included), whitespace and URL delimiters. Brackets, `:` and `%` stay allowed for
+/// IPv6 literals, ports and scope ids.
+fn is_forbidden_host_char(c: char) -> bool {
+    c.is_ascii_control() || c.is_whitespace() || matches!(c, '/' | '\\' | '@' | '?' | '#')
 }
 
 /// Interpret numeric host spellings without consulting DNS. System resolvers
@@ -251,6 +266,44 @@ mod tests {
     use super::*;
 
     use pretty_assertions::assert_eq;
+
+    // Invision: a hostname with a NUL byte or other control/delimiter characters must never reach
+    // the allowlist matcher. `evil.example\0.allowed.example` matched `*.allowed.example` while the
+    // system resolver stopped at the NUL and dialed `evil.example` (SOCKS5 bypass reported in 2026).
+    #[test]
+    fn host_parse_rejects_control_and_delimiter_characters() {
+        for host in [
+            "evil.example\0.allowed.example",
+            "evil.example\u{0}",
+            "evil.example\t.allowed.example",
+            "evil.example\n.allowed.example",
+            "evil.example\r",
+            "evil.example\u{7f}.allowed.example",
+            "evil example.allowed.example",
+            "evil.example/.allowed.example",
+            "evil.example\\.allowed.example",
+            "user@evil.example",
+            "evil.example?.allowed.example",
+            "evil.example#.allowed.example",
+        ] {
+            assert!(Host::parse(host).is_err(), "should reject {host:?}");
+        }
+    }
+
+    #[test]
+    fn host_parse_keeps_regular_hosts() {
+        for (input, expected) in [
+            ("Api.Example.com", "api.example.com"),
+            ("api.example.com.", "api.example.com"),
+            ("api.example.com:443", "api.example.com"),
+            ("my_service.internal", "my_service.internal"),
+            ("[::1]", "::1"),
+            ("127.0.0.1", "127.0.0.1"),
+            ("xn--bcher-kva.example", "xn--bcher-kva.example"),
+        ] {
+            assert_eq!(Host::parse(input).expect(input).as_str(), expected);
+        }
+    }
 
     #[test]
     fn method_allowed_full_allows_everything() {
